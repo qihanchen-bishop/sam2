@@ -12,3 +12,5 @@ demo/backend/checkpoints/*.pt
 datasets/
 runs/
 yolo*.pt
+generated_sam2_prompts/
+newdatat/

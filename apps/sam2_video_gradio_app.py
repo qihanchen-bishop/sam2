@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import gc
 import colorsys
+import ctypes
 import json
 import os
 import shutil
@@ -141,6 +142,7 @@ class AppState:
 
 
 PREDICTOR_CACHE: dict[str, Any] = {}
+DEFAULT_OUTPUT_ROOT = REPO_ROOT / "outputs"
 
 
 def select_device() -> torch.device:
@@ -220,7 +222,7 @@ def label_dropdown(labels: list[str], value: str | None = None) -> gr.Dropdown:
 
 
 def scan_tasks(output_root: str) -> tuple[gr.Dropdown, str]:
-    root = abs_path(output_root or (REPO_ROOT / "outputs"))
+    root = abs_path(output_root or DEFAULT_OUTPUT_ROOT)
     root.mkdir(parents=True, exist_ok=True)
     tasks = list_tasks(root)
     msg = f"输出根目录: {root}\n找到 {len(tasks)} 个 task。"
@@ -233,7 +235,7 @@ def use_task(output_root: str, task_name: str, state: AppState | None) -> tuple[
     state = state or AppState()
     if not task_name:
         raise gr.Error("请输入或选择 task。")
-    output_root_path = abs_path(output_root or (REPO_ROOT / "outputs"))
+    output_root_path = abs_path(output_root or DEFAULT_OUTPUT_ROOT)
     task_path = task_dir_from_root(output_root_path, task_name)
     task_path.mkdir(parents=True, exist_ok=True)
     labels = load_task_labels(task_path)
@@ -266,13 +268,13 @@ def add_task_label(
     label = (new_label or "").strip()
     if not label:
         raise gr.Error("请输入新增标签名称。")
-    task_path = task_dir_from_root(output_root or state.output_root or (REPO_ROOT / "outputs"), task_name)
+    task_path = task_dir_from_root(output_root or state.output_root or DEFAULT_OUTPUT_ROOT, task_name)
     task_path.mkdir(parents=True, exist_ok=True)
     labels = load_task_labels(task_path)
     if label not in labels:
         labels.append(label)
         save_task_labels(task_path, labels)
-    state.output_root = str(abs_path(output_root or (REPO_ROOT / "outputs")))
+    state.output_root = str(abs_path(output_root or DEFAULT_OUTPUT_ROOT))
     state.task_name = task_name.strip()
     state.task_dir = str(task_path)
     state.task_labels = labels
@@ -280,11 +282,29 @@ def add_task_label(
 
 
 def task_dir_from_root(output_root: str | Path | None, task_name: str | None) -> Path:
-    root = abs_path(output_root or (REPO_ROOT / "outputs"))
+    root = abs_path(output_root or DEFAULT_OUTPUT_ROOT)
     task = (task_name or "default").strip()
     if not task:
         task = "default"
     return root / task
+
+
+def seg_root_for_video(video_path: str | Path | None) -> Path:
+    path = abs_path(video_path or ".")
+    parts = path.parts
+    if "videos" in parts:
+        videos_idx = parts.index("videos")
+        if videos_idx > 0:
+            return Path(*parts[:videos_idx]) / "seg"
+    base_dir = path if path.is_dir() else path.parent
+    return base_dir / "seg"
+
+
+def default_output_root_for_video(video_path: str | Path | None, current_output_root: str | None = None) -> Path:
+    current = abs_path(current_output_root) if current_output_root else None
+    if current is None or current == DEFAULT_OUTPUT_ROOT:
+        return seg_root_for_video(video_path)
+    return current
 
 
 def task_labels_file(task_dir: str | Path) -> Path:
@@ -330,25 +350,34 @@ def list_tasks(output_root: str | Path) -> list[str]:
 
 
 def label_dir_from_root(task_root: str | Path | None, video_path: str | None) -> str:
-    root = abs_path(task_root or (REPO_ROOT / "outputs" / "default"))
+    root = abs_path(task_root or (DEFAULT_OUTPUT_ROOT / "default"))
     stem = Path(video_path or "video").stem
     return str(root / f"{stem}_sam2_masks")
 
 
 def legacy_label_dir_from_root(task_root: str | Path | None, video_path: str | None) -> str:
-    root = abs_path(task_root or (REPO_ROOT / "outputs" / "default"))
+    root = abs_path(task_root or (DEFAULT_OUTPUT_ROOT / "default"))
     stem = Path(video_path or "video").stem
     return str(root / f"{stem}_sam2_labels")
 
 
 def saved_mask_dir_from_root(task_root: str | Path | None, video_path: str | None) -> str:
-    root = abs_path(task_root or (REPO_ROOT / "outputs" / "default"))
+    root = abs_path(task_root or (DEFAULT_OUTPUT_ROOT / "default"))
     stem = Path(video_path or "video").stem
     return str(root / f"{stem}_sam2_masks" / "mask_frames")
 
 
 def prompt_file(label_dir: str | Path) -> Path:
     return abs_path(label_dir) / PROMPT_FILE_NAME
+
+
+def prompt_matches_video(prompt_path: Path, frame_count: int) -> bool:
+    try:
+        data = json.loads(prompt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    saved_frame_count = data.get("frame_count")
+    return saved_frame_count is None or int(saved_frame_count) == int(frame_count)
 
 
 def contains_jpeg_frames(path: Path) -> bool:
@@ -375,6 +404,22 @@ def cache_dir_for_video(video_path: Path) -> Path:
     return CACHE_ROOT / key
 
 
+def video_cache_metadata(video_path: Path) -> dict[str, int | str]:
+    stat = video_path.stat()
+    return {
+        "path": str(video_path.resolve()),
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
+def cache_is_current(marker: Path, video_path: Path) -> bool:
+    try:
+        return json.loads(marker.read_text(encoding="utf-8")) == video_cache_metadata(video_path)
+    except (OSError, json.JSONDecodeError):
+        return False
+
+
 def prepare_frame_dir(video_path: str) -> tuple[Path, list[str]]:
     src = abs_path(video_path)
     if src.is_dir():
@@ -385,12 +430,14 @@ def prepare_frame_dir(video_path: str) -> tuple[Path, list[str]]:
 
     out_dir = cache_dir_for_video(src)
     marker = out_dir / ".complete"
-    if marker.exists():
+    if marker.exists() and cache_is_current(marker, src):
         return out_dir, get_frame_names(out_dir)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     for old_frame in out_dir.glob("*.jpg"):
         old_frame.unlink()
+    if marker.exists():
+        marker.unlink()
 
     cmd = [
         "ffmpeg",
@@ -417,7 +464,7 @@ def prepare_frame_dir(video_path: str) -> tuple[Path, list[str]]:
         err = exc.stderr.decode("utf-8", errors="replace")[-2000:]
         raise RuntimeError(f"ffmpeg 抽帧失败:\n{err}") from exc
 
-    marker.write_text("ok\n", encoding="utf-8")
+    marker.write_text(json.dumps(video_cache_metadata(src), indent=2) + "\n", encoding="utf-8")
     return out_dir, get_frame_names(out_dir)
 
 
@@ -443,13 +490,14 @@ def load_video(
         raise gr.Error("请先选择或创建 task。")
 
     state = state or AppState()
-    task_path = task_dir_from_root(output_root or (REPO_ROOT / "outputs"), task_name)
+    output_root_path = default_output_root_for_video(video_path, output_root)
+    task_path = task_dir_from_root(output_root_path, task_name)
     task_path.mkdir(parents=True, exist_ok=True)
     task_labels = load_task_labels(task_path)
     frame_dir, frame_names = prepare_frame_dir(video_path)
     first = Image.open(frame_dir / frame_names[0]).convert("RGB")
 
-    state.output_root = str(abs_path(output_root or (REPO_ROOT / "outputs")))
+    state.output_root = str(output_root_path)
     state.task_name = task_name.strip()
     state.task_dir = str(task_path)
     state.task_labels = task_labels
@@ -469,17 +517,24 @@ def load_video(
 
     msg = f"已载入 {Path(video_path).name}: {len(frame_names)} 帧，尺寸 {first.width}x{first.height}。"
     msg += f"\nTask: {state.task_name}"
+    msg += f"\n输出根目录: {state.output_root}"
     label_path = prompt_file(state.label_dir)
-    if label_path.exists():
+    if label_path.exists() and prompt_matches_video(label_path, len(frame_names)):
         load_prompts_from_disk(state.label_dir, state)
         sync_active_object_for_current_frame(state)
         msg += f"\n已从标签路径加载已有标注: {label_path}"
-    elif prompt_file(legacy_label_dir_from_root(task_path, video_path)).exists():
+    elif label_path.exists():
+        msg += f"\n发现旧标注但帧数不匹配，已跳过: {label_path}"
+        msg += f"\n如需重新标注，可直接保存覆盖该路径。"
+    elif prompt_file(legacy_label_dir_from_root(task_path, video_path)).exists() and prompt_matches_video(prompt_file(legacy_label_dir_from_root(task_path, video_path)), len(frame_names)):
         legacy_path = prompt_file(legacy_label_dir_from_root(task_path, video_path))
         load_prompts_from_disk(str(legacy_path.parent), state)
         sync_active_object_for_current_frame(state)
         msg += f"\n已从旧标签路径加载已有标注: {legacy_path}"
         msg += f"\n后续会保存到新路径: {label_path}"
+    elif prompt_file(legacy_label_dir_from_root(task_path, video_path)).exists():
+        legacy_path = prompt_file(legacy_label_dir_from_root(task_path, video_path))
+        msg += f"\n发现旧格式标注但帧数不匹配，已跳过: {legacy_path}"
     else:
         msg += f"\n标签路径: {state.label_dir}"
     saved_mask_dir = Path(state.saved_mask_dir)
@@ -735,7 +790,22 @@ def all_object_dropdown(state: AppState, value: int | None = None) -> gr.Dropdow
 
 def annotation_dropdown(state: AppState) -> gr.Dropdown:
     choices: list[tuple[str, str]] = []
-    for obj_id, obj in sorted(state.objects.items()):
+    for obj_id, obj in sorted(state.objects.items(), reverse=True):
+        current_frame_points: list[tuple[int, float, float, int]] = []
+        point_idx = 0
+        for frame_idx, x, y, label in obj.points:
+            if frame_idx != state.current_frame_idx:
+                continue
+            current_frame_points.append((point_idx, x, y, label))
+            point_idx += 1
+        for point_idx, x, y, label in reversed(current_frame_points):
+            point_name = "正点" if label == 1 else "负点"
+            choices.append(
+                (
+                    f"{obj_id}:{obj.name} | {point_name} #{point_idx + 1} ({x:.0f},{y:.0f})",
+                    f"point:{obj_id}:{state.current_frame_idx}:{point_idx}",
+                )
+            )
         if state.current_frame_idx in obj.boxes:
             x0, y0, x1, y1 = obj.boxes[state.current_frame_idx]
             choices.append(
@@ -744,18 +814,6 @@ def annotation_dropdown(state: AppState) -> gr.Dropdown:
                     f"box:{obj_id}:{state.current_frame_idx}",
                 )
             )
-        point_idx = 0
-        for frame_idx, x, y, label in obj.points:
-            if frame_idx != state.current_frame_idx:
-                continue
-            point_name = "正点" if label == 1 else "负点"
-            choices.append(
-                (
-                    f"{obj_id}:{obj.name} | {point_name} #{point_idx + 1} ({x:.0f},{y:.0f})",
-                    f"point:{obj_id}:{state.current_frame_idx}:{point_idx}",
-                )
-            )
-            point_idx += 1
     return gr.Dropdown(choices=choices, value=choices[0][1] if choices else None)
 
 
@@ -883,7 +941,7 @@ def set_label_root(label_root: str, state: AppState | None) -> tuple[Image.Image
 def save_label_dir(label_root: str, state: AppState | None) -> tuple[str, AppState]:
     state = state or AppState()
     task_path = task_dir_from_root(label_root, state.task_name)
-    state.output_root = str(abs_path(label_root or (REPO_ROOT / "outputs")))
+    state.output_root = str(abs_path(label_root or state.output_root or DEFAULT_OUTPUT_ROOT))
     state.task_dir = str(task_path)
     state.saved_mask_dir = saved_mask_dir_from_root(task_path, state.video_path)
     state.label_dir = label_dir_from_root(task_path, state.video_path)
@@ -1340,6 +1398,76 @@ def clear_cuda_memory() -> None:
             torch.cuda.ipc_collect()
         except Exception:
             pass
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
+def memory_report() -> str:
+    rss_gib = None
+    available_gib = None
+    try:
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("VmRSS:"):
+                rss_gib = int(line.split()[1]) / 1024**2
+                break
+    except OSError:
+        pass
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                available_gib = int(line.split()[1]) / 1024**2
+                break
+    except OSError:
+        pass
+    parts = []
+    if rss_gib is not None:
+        parts.append(f"RAM RSS {rss_gib:.2f} GiB")
+    if available_gib is not None:
+        parts.append(f"MemAvailable {available_gib:.2f} GiB")
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        parts.append(f"CUDA alloc {allocated:.2f} GiB")
+        parts.append(f"reserved {reserved:.2f} GiB")
+    return " | ".join(parts) if parts else "memory n/a"
+
+
+def available_memory_gib() -> float | None:
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) / 1024**2
+    except OSError:
+        return None
+    return None
+
+
+def log_memory_event(message: str, log_path: Path | None = None) -> None:
+    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message} | {memory_report()}"
+    print(line, flush=True)
+    if log_path is None:
+        return
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError as exc:
+        print(f"[SAM2 GUI] failed to write memory log {log_path}: {exc}", flush=True)
+
+
+def enforce_memory_guard(min_available_gib: float, log_path: Path | None = None) -> None:
+    available = available_memory_gib()
+    if available is None or available >= min_available_gib:
+        return
+    clear_cuda_memory()
+    message = (
+        f"系统可用内存只剩 {available:.2f} GiB，低于保护阈值 {min_available_gib:.2f} GiB，"
+        "已停止本轮批处理以避免死机。"
+    )
+    log_memory_event(message, log_path)
+    raise gr.Error(message)
 
 
 def release_inference_state(predictor: Any | None, inference_state: Any | None) -> None:
@@ -1660,7 +1788,7 @@ def init_state_for_batch_video(
     frame_dir, frame_names = prepare_frame_dir(video_path)
     first = Image.open(frame_dir / frame_names[0]).convert("RGB")
     state = AppState()
-    state.output_root = str(abs_path(output_root or (REPO_ROOT / "outputs")))
+    state.output_root = str(default_output_root_for_video(video_path, output_root))
     state.task_name = task_name.strip()
     state.task_dir = str(task_path)
     state.task_labels = task_labels
@@ -1715,6 +1843,8 @@ def batch_segment_remaining_videos(
     weights_path: str,
     conf: float,
     add_center_point: bool,
+    batch_limit: int | float,
+    min_available_ram_gib: int | float,
     model_name: str,
     vos_optimized: bool,
     offload_video_to_cpu: bool,
@@ -1724,8 +1854,16 @@ def batch_segment_remaining_videos(
     if not task_name:
         raise gr.Error("请先选择或创建 task。")
 
-    task_path = task_dir_from_root(output_root or (REPO_ROOT / "outputs"), task_name)
+    output_root_path = default_output_root_for_video(video_root, output_root)
+    task_path = task_dir_from_root(output_root_path, task_name)
     task_path.mkdir(parents=True, exist_ok=True)
+    memory_log_path = task_path / "batch_memory.log"
+    min_available_ram_gib = max(1.0, float(min_available_ram_gib or 8.0))
+    log_memory_event(
+        f"批量分割启动: video_root={video_root}, task={task_name}, batch_limit={batch_limit}, min_available_ram_gib={min_available_ram_gib}",
+        memory_log_path,
+    )
+    enforce_memory_guard(min_available_ram_gib, memory_log_path)
     task_labels = load_task_labels(task_path)
     if not task_labels:
         raise gr.Error(f"当前 task 没有标签，请先维护 {task_labels_file(task_path)}。")
@@ -1735,25 +1873,33 @@ def batch_segment_remaining_videos(
     skipped = len(candidates) - len(pending)
     if not pending:
         return None, None, f"没有待处理视频。共扫描 {len(candidates)} 个，已处理 {skipped} 个。", AppState(), gr.Dropdown(), gr.Dropdown(), gr.Dropdown(), gr.Dropdown(), gr.ColorPicker(value=generated_color(1)), gr.Slider(value=0)
+    limit = max(1, int(batch_limit or 5))
+    total_pending = len(pending)
+    pending = pending[:limit]
 
-    progress(0.01, desc="加载 YOLO 模型")
+    progress(0.01, desc=f"加载 YOLO 模型 | {memory_report()}")
     yolo_model = build_yolo_model(weights_path)
+    log_memory_event("YOLO 模型已加载", memory_log_path)
     started_at = time.monotonic()
     processed: list[str] = []
     failed: list[str] = []
+    memory_logs: list[str] = []
     last_state = AppState()
     last_video: str | None = None
 
     for index, video_path in enumerate(pending, start=1):
+        enforce_memory_guard(min_available_ram_gib, memory_log_path)
         elapsed = time.monotonic() - started_at
         eta = None if index == 1 else elapsed / (index - 1) * (len(pending) - index + 1)
         prefix = (
             f"批处理 {index}/{len(pending)}: {Path(video_path).name} | "
-            f"已跳过 {skipped} | ETA {format_duration(eta)}"
+            f"已跳过 {skipped} | 待处理总数 {total_pending} | ETA {format_duration(eta)} | {memory_report()}"
         )
         start = (index - 1) / len(pending)
         end = index / len(pending)
         progress(start, desc=prefix)
+        log_memory_event(f"开始处理 {index}/{len(pending)}: {video_path}", memory_log_path)
+        state = None
         try:
             state = init_state_for_batch_video(video_path, output_root, task_name, task_path, task_labels)
             missed, target_frames = add_yolo_prompts_at_batch_frames(
@@ -1782,13 +1928,29 @@ def batch_segment_remaining_videos(
             last_video = overlay_video
         except Exception as exc:
             failed.append(f"{Path(video_path).name}: {exc}")
+            log_memory_event(f"处理失败 {video_path}: {exc}", memory_log_path)
+        finally:
+            PREDICTOR_CACHE.clear()
+            if state is not None and state is not last_state:
+                state.objects.clear()
+                state.frame_names.clear()
             clear_cuda_memory()
-        progress(end, desc=f"{prefix} | 完成")
+            mem = memory_report()
+            memory_logs.append(f"{Path(video_path).name}: {mem}")
+            log_memory_event(f"完成清理 {video_path}", memory_log_path)
+            progress(end, desc=f"{prefix} | 完成清理 | {mem}")
 
     elapsed = time.monotonic() - started_at
+    del yolo_model
+    PREDICTOR_CACHE.clear()
+    clear_cuda_memory()
+    log_memory_event("本轮批量分割结束", memory_log_path)
     msg = [
-        f"批处理完成。扫描 {len(candidates)} 个，跳过已处理 {skipped} 个，成功 {len(processed)} 个，失败 {len(failed)} 个。",
+        f"本轮批处理完成。扫描 {len(candidates)} 个，跳过已处理 {skipped} 个，待处理 {total_pending} 个，本轮最多 {limit} 个，成功 {len(processed)} 个，失败 {len(failed)} 个。",
+        f"剩余未处理约 {max(total_pending - len(processed) - len(failed), 0)} 个，可再次点击继续下一轮。",
         f"总耗时: {format_duration(elapsed)}",
+        f"清理后内存: {memory_report()}",
+        f"内存日志: {memory_log_path}",
     ]
     if processed:
         msg.append("成功:")
@@ -1796,6 +1958,9 @@ def batch_segment_remaining_videos(
     if failed:
         msg.append("失败:")
         msg.extend(failed)
+    if memory_logs:
+        msg.append("内存记录:")
+        msg.extend(memory_logs[-10:])
     return (
         draw_prompts(last_state) if last_state.frame_dir else None,
         last_video,
@@ -1831,19 +1996,28 @@ def run_segmentation(
     if not prompted:
         raise gr.Error("对象还没有点或框。")
 
-    progress(0.05, desc="加载 SAM 2 模型")
+    memory_log_path = (Path(state.task_dir) / "sam2_memory.log") if state.task_dir else None
+    log_memory_event(
+        f"SAM2 分割开始: video={state.video_path or state.frame_dir}, frames={len(state.frame_names)}, objects={len(prompted)}",
+        memory_log_path,
+    )
+    progress(0.05, desc=f"加载 SAM 2 模型 | {memory_report()}")
     clear_cuda_memory()
     predictor = build_predictor(model_name, vos_optimized)
+    log_memory_event("SAM2 模型已加载", memory_log_path)
     inference_state = None
     video_segments: dict[int, dict[int, np.ndarray]] = {}
     try:
         with torch.inference_mode(), maybe_autocast():
-            progress(0.12, desc="初始化视频状态")
+            progress(0.12, desc=f"初始化视频状态 | {memory_report()}")
+            log_memory_event("初始化视频状态前", memory_log_path)
             inference_state = predictor.init_state(
                 state.frame_dir,
                 offload_video_to_cpu=offload_video_to_cpu,
                 offload_state_to_cpu=offload_state_to_cpu,
+                async_loading_frames=True,
             )
+            log_memory_event("初始化视频状态后", memory_log_path)
 
             prompt_frame_indices: list[int] = []
             for obj_id, obj in prompted:
@@ -1873,7 +2047,8 @@ def run_segmentation(
                     )
                     del out_mask_logits
 
-            progress(0.25, desc="传播到全视频")
+            progress(0.25, desc=f"传播到全视频 | {memory_report()}")
+            log_memory_event("正向传播开始", memory_log_path)
             total = len(state.frame_names)
             start_frame_idx = min(prompt_frame_indices)
             for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
@@ -1884,11 +2059,14 @@ def run_segmentation(
                     for i, out_obj_id in enumerate(out_obj_ids)
                 }
                 del out_mask_logits
-                progress(0.25 + 0.55 * (out_frame_idx + 1) / max(total, 1), desc=f"传播第 {out_frame_idx + 1}/{total} 帧")
+                if out_frame_idx % 10 == 0 or out_frame_idx == total - 1:
+                    log_memory_event(f"正向传播第 {out_frame_idx + 1}/{total} 帧", memory_log_path)
+                progress(0.25 + 0.55 * (out_frame_idx + 1) / max(total, 1), desc=f"传播第 {out_frame_idx + 1}/{total} 帧 | {memory_report()}")
 
             reverse_start_idx = max(prompt_frame_indices)
             if reverse_start_idx > 0:
-                progress(0.80, desc="向前反向传播")
+                progress(0.80, desc=f"向前反向传播 | {memory_report()}")
+                log_memory_event("反向传播开始", memory_log_path)
                 for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
                     inference_state, start_frame_idx=reverse_start_idx, reverse=True
                 ):
@@ -1897,10 +2075,13 @@ def run_segmentation(
                         for i, out_obj_id in enumerate(out_obj_ids)
                     }
                     del out_mask_logits
+                    if out_frame_idx % 10 == 0 or out_frame_idx == 0:
+                        log_memory_event(f"反向传播第 {out_frame_idx + 1}/{total} 帧", memory_log_path)
     except torch.cuda.OutOfMemoryError as exc:
         release_inference_state(predictor, inference_state)
+        log_memory_event("CUDA OOM，已释放 inference_state", memory_log_path)
         if not (offload_video_to_cpu and offload_state_to_cpu):
-            progress(0.05, desc="显存不足，已清理并自动启用 CPU offload 重试")
+            progress(0.05, desc=f"显存不足，已清理并自动启用 CPU offload 重试 | {memory_report()}")
             return run_segmentation(
                 model_name,
                 vos_optimized,
@@ -1916,8 +2097,10 @@ def run_segmentation(
     finally:
         release_inference_state(predictor, inference_state)
         inference_state = None
+        log_memory_event("已释放 inference_state", memory_log_path)
 
-    progress(0.84, desc="导出结果")
+    progress(0.84, desc=f"导出结果 | {memory_report()}")
+    log_memory_event("导出结果前", memory_log_path)
     out_dir = export_results(state, video_segments)
     state.saved_mask_dir = str(out_dir / "mask_frames")
     state.show_saved_masks = True
@@ -1927,7 +2110,11 @@ def run_segmentation(
     msg += "\n可视化 mask 请看 mask_visual_frames；单对象 0/255 二值 mask 请看 object_mask_frames。"
     if overlay_video:
         msg += f"\nOverlay 视频: {overlay_video}"
-    return draw_prompts(state), overlay_video, msg, state
+    output_image = draw_prompts(state)
+    video_segments.clear()
+    clear_cuda_memory()
+    log_memory_event("SAM2 分割结束并清理 video_segments", memory_log_path)
+    return output_image, overlay_video, msg, state
 
 
 def render_overlay(state: AppState, frame: Image.Image | None, masks: dict[int, np.ndarray]) -> Image.Image | None:
@@ -2023,8 +2210,8 @@ def build_ui() -> gr.Blocks:
         demo.css = css
         state = gr.State(AppState())
         gr.Markdown("## SAM 2 视频分割工作台")
-        default_video_root = "/home/romilab/Projects/IsaacLab/source/msr-surgical/saved_data/cube1/videos/observation.images.camera/chunk-000"
-        default_output_root = str(REPO_ROOT / "outputs")
+        default_video_root = "/home/romilab/Projects/IsaacLab/source/lerobot/data/soarmcube277/videos/observation.images.left_front/chunk-000/"
+        default_output_root = str(seg_root_for_video(default_video_root))
         default_tasks = list_tasks(default_output_root)
         default_task = default_tasks[0] if default_tasks else ""
 
@@ -2113,7 +2300,7 @@ def build_ui() -> gr.Blocks:
                 with gr.Accordion("YOLO 自动 Prompt", open=False):
                     yolo_weights = gr.Textbox(
                         label="YOLO 权重",
-                        value=str(REPO_ROOT / "runs/yolo/task1_detect/weights/best.pt"),
+                        value="/home/romilab/Projects/IsaacLab/source/lerobot/data/soarmcube277/yolo/runs/task1_yolo26n_continue/weights/best.pt",
                         interactive=True,
                     )
                     yolo_conf = gr.Slider(
@@ -2135,6 +2322,20 @@ def build_ui() -> gr.Blocks:
                     yolo_run_btn = gr.Button("YOLO 生成 Prompt 并分割导出", variant="primary")
 
                 with gr.Accordion("批量自动分割", open=False):
+                    batch_limit = gr.Number(
+                        label="每轮最多处理视频数",
+                        value=5,
+                        precision=0,
+                        minimum=1,
+                        interactive=True,
+                    )
+                    min_available_ram = gr.Number(
+                        label="低于此可用 RAM 就停止本轮 GiB",
+                        value=8,
+                        precision=1,
+                        minimum=1,
+                        interactive=True,
+                    )
                     batch_run_btn = gr.Button("分割当前目录剩余视频", variant="primary")
 
             with gr.Column(scale=2):
@@ -2278,6 +2479,7 @@ def build_ui() -> gr.Blocks:
             run_segmentation,
             inputs=[model_name, vos_optimized, offload_video, offload_state, state],
             outputs=[prompt_image, result_video, status, state],
+            show_progress_on=status,
         )
         yolo_prompt_btn.click(
             yolo_generate_prompts,
@@ -2320,6 +2522,7 @@ def build_ui() -> gr.Blocks:
                 object_color_picker,
                 frame_slider,
             ],
+            show_progress_on=status,
         )
         batch_run_btn.click(
             batch_segment_remaining_videos,
@@ -2330,6 +2533,8 @@ def build_ui() -> gr.Blocks:
                 yolo_weights,
                 yolo_conf,
                 yolo_add_center,
+                batch_limit,
+                min_available_ram,
                 model_name,
                 vos_optimized,
                 offload_video,
@@ -2347,6 +2552,7 @@ def build_ui() -> gr.Blocks:
                 object_color_picker,
                 frame_slider,
             ],
+            show_progress_on=status,
         )
         clear_gpu_btn.click(clear_gpu_cache, outputs=status)
         demo.load(list_videos, inputs=video_root, outputs=[video_dropdown, status])
@@ -2358,4 +2564,15 @@ if __name__ == "__main__":
     CACHE_ROOT.mkdir(parents=True, exist_ok=True)
     server_name = os.environ.get("SAM2_GRADIO_HOST", "127.0.0.1")
     server_port = int(os.environ.get("SAM2_GRADIO_PORT", "7860"))
-    build_ui().launch(server_name=server_name, server_port=server_port, inbrowser=False)
+    extra_allowed = [
+        Path(path).expanduser()
+        for path in os.environ.get("SAM2_GRADIO_ALLOWED_PATHS", "").split(os.pathsep)
+        if path
+    ]
+    allowed_paths = [REPO_ROOT.parent, CACHE_ROOT, *extra_allowed]
+    build_ui().launch(
+        server_name=server_name,
+        server_port=server_port,
+        inbrowser=False,
+        allowed_paths=[str(path) for path in allowed_paths],
+    )

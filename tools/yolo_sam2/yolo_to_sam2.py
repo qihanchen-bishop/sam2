@@ -224,7 +224,7 @@ def main() -> None:
             str(args.sam2_checkpoint),
             device=device,
         )
-        inference_state = predictor.init_state(video_path=str(frame_dir), async_loading_frames=False)
+        inference_state = predictor.init_state(video_path=str(frame_dir), async_loading_frames=True)
 
         for class_id in sorted(prompts):
             prompt = prompts[class_id]

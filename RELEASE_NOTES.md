@@ -25,3 +25,35 @@
   * SAM 2 code: https://github.com/facebookresearch/sam2
   * SAM 2 demo: https://sam2.metademolab.com/
   * SAM 2 paper: https://arxiv.org/abs/2408.00714
+
+conda activate sam2
+cd /home/romilab/Projects/IsaacLab/source/sam2
+
+python -m pip uninstall -y SAM-2
+python -m pip install -e .
+python -m pip install -r tools/yolo_sam2/requirements-yolo.txt
+cd /home/romilab/Projects/IsaacLab/source/sam2
+
+cd /home/romilab/Projects/IsaacLab/source/sam2
+
+conda run -n sam2 python tools/yolo_sam2/convert_sam2_masks_to_yolo.py \
+  --input /home/romilab/Projects/IsaacLab/source/lerobot/data/soarmcube277/yolo \
+  --output /home/romilab/Projects/IsaacLab/source/lerobot/data/soarmcube277/yolo/task1_yolo_detect \
+  --task detect \
+  --split-mode random \
+  --train-ratio 0.8 \
+  --seed 42 \
+  --overwrite
+
+conda run -n sam2 python tools/yolo_sam2/train_yolo.py \
+  --data /home/romilab/Projects/IsaacLab/source/lerobot/data/soarmcube277/seg/yolo/task1_yolo_detect/data.yaml \
+  --model /home/romilab/Projects/IsaacLab/source/sam2/yolo26n.pt \
+  --epochs 100 \
+  --imgsz 640 \
+  --batch auto \
+  --patience 20 \
+  --project /home/romilab/Projects/IsaacLab/source/lerobot/data/soarmcube277/yolo/runs \
+  --name task1_yolo26n_continue
+
+  cd /home/romilab/Projects/IsaacLab/source/sam2
+
