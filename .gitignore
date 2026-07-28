@@ -14,3 +14,13 @@ runs/
 yolo*.pt
 generated_sam2_prompts/
 newdatat/
+segdata/*
+!segdata/origin/
+!segdata/temp/
+!segdata/final/
+segdata/origin/*
+segdata/temp/*
+segdata/final/*
+!segdata/origin/.gitkeep
+!segdata/temp/.gitkeep
+!segdata/final/.gitkeep
