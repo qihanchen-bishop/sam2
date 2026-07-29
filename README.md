@@ -1,224 +1,239 @@
-# SAM 2: Segment Anything in Images and Videos
+# SAM2-YOLO Video Annotation Pipeline
 
-**[AI at Meta, FAIR](https://ai.meta.com/research/)**
+This project extends [SAM 2](https://github.com/facebookresearch/sam2) for semi-automatic video segmentation annotation.
 
-[Nikhila Ravi](https://nikhilaravi.com/), [Valentin Gabeur](https://gabeur.github.io/), [Yuan-Ting Hu](https://scholar.google.com/citations?user=E8DVVYQAAAAJ&hl=en), [Ronghang Hu](https://ronghanghu.com/), [Chaitanya Ryali](https://scholar.google.com/citations?user=4LWx24UAAAAJ&hl=en), [Tengyu Ma](https://scholar.google.com/citations?user=VeTSl0wAAAAJ&hl=en), [Haitham Khedr](https://hkhedr.com/), [Roman Rädle](https://scholar.google.de/citations?user=Tpt57v0AAAAJ&hl=en), [Chloe Rolland](https://scholar.google.com/citations?hl=fr&user=n-SnMhoAAAAJ), [Laura Gustafson](https://scholar.google.com/citations?user=c8IpF9gAAAAJ&hl=en), [Eric Mintun](https://ericmintun.github.io/), [Junting Pan](https://junting.github.io/), [Kalyan Vasudev Alwala](https://scholar.google.co.in/citations?user=m34oaWEAAAAJ&hl=en), [Nicolas Carion](https://www.nicolascarion.com/), [Chao-Yuan Wu](https://chaoyuan.org/), [Ross Girshick](https://www.rossgirshick.info/), [Piotr Dollár](https://pdollar.github.io/), [Christoph Feichtenhofer](https://feichtenhofer.github.io/)
+The workflow is designed for datasets where fully manual video mask annotation is too expensive:
 
-[[`Paper`](https://ai.meta.com/research/publications/sam-2-segment-anything-in-images-and-videos/)] [[`Project`](https://ai.meta.com/sam2)] [[`Demo`](https://sam2.metademolab.com/)] [[`Dataset`](https://ai.meta.com/datasets/segment-anything-video)] [[`Blog`](https://ai.meta.com/blog/segment-anything-2)] [[`BibTeX`](#citing-sam-2)]
+1. Manually add a small number of prompts on several seed videos.
+2. Use SAM2 to propagate the prompts and export segmentation masks.
+3. Convert these SAM2 masks into a YOLO detection dataset.
+4. Train a YOLO detector on the seed annotations.
+5. Use YOLO to batch-generate box prompts for the remaining videos.
+6. Run SAM2 again to export segmentation masks for the full video set.
 
-![SAM 2 architecture](assets/model_diagram.png?raw=true)
+The original SAM2 model code, configs, checkpoints, and license come from Meta's official repository:
+<https://github.com/facebookresearch/sam2>
 
-**Segment Anything Model 2 (SAM 2)** is a foundation model towards solving promptable visual segmentation in images and videos. We extend SAM to video by considering images as a video with a single frame. The model design is a simple transformer architecture with streaming memory for real-time video processing. We build a model-in-the-loop data engine, which improves model and data via user interaction, to collect [**our SA-V dataset**](https://ai.meta.com/datasets/segment-anything-video), the largest video segmentation dataset to date. SAM 2 trained on our data provides strong performance across a wide range of tasks and visual domains.
+## Environment
 
-![SA-V dataset](assets/sa_v_dataset.jpg?raw=true)
-
-## Latest updates
-
-**12/11/2024 -- full model compilation for a major VOS speedup and a new `SAM2VideoPredictor` to better handle multi-object tracking**
-
-- We now support `torch.compile` of the entire SAM 2 model on videos, which can be turned on by setting `vos_optimized=True` in `build_sam2_video_predictor`, leading to a major speedup for VOS inference.
-- We update the implementation of `SAM2VideoPredictor` to support independent per-object inference, allowing us to relax the assumption of prompting for multi-object tracking and adding new objects after tracking starts.
-- See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for full details.
-
-**09/30/2024 -- SAM 2.1 Developer Suite (new checkpoints, training code, web demo) is released**
-
-- A new suite of improved model checkpoints (denoted as **SAM 2.1**) are released. See [Model Description](#model-description) for details.
-  * To use the new SAM 2.1 checkpoints, you need the latest model code from this repo. If you have installed an earlier version of this repo, please first uninstall the previous version via `pip uninstall SAM-2`, pull the latest code from this repo (with `git pull`), and then reinstall the repo following [Installation](#installation) below.
-- The training (and fine-tuning) code has been released. See [`training/README.md`](training/README.md) on how to get started.
-- The frontend + backend code for the SAM 2 web demo has been released. See [`demo/README.md`](demo/README.md) for details.
-
-## Installation
-
-SAM 2 needs to be installed first before use. The code requires `python>=3.10`, as well as `torch>=2.5.1` and `torchvision>=0.20.1`. Please follow the instructions [here](https://pytorch.org/get-started/locally/) to install both PyTorch and TorchVision dependencies. You can install SAM 2 on a GPU machine using:
+If the server has proxy variables configured and downloads are slow or unstable, clear them before installing packages:
 
 ```bash
-git clone https://github.com/facebookresearch/sam2.git && cd sam2
-
-pip install -e .
+unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
+export NO_PROXY=localhost,127.0.0.1,::1
+export no_proxy=localhost,127.0.0.1,::1
 ```
-If you are installing on Windows, it's strongly recommended to use [Windows Subsystem for Linux (WSL)](https://learn.microsoft.com/en-us/windows/wsl/install) with Ubuntu.
 
-To use the SAM 2 predictor and run the example notebooks, `jupyter` and `matplotlib` are required and can be installed by:
+Create and activate a conda environment:
 
 ```bash
-pip install -e ".[notebooks]"
+conda create -n sam2 python=3.10 pip -y
+conda activate sam2
 ```
 
-Note:
-1. It's recommended to create a new Python environment via [Anaconda](https://www.anaconda.com/) for this installation and install PyTorch 2.5.1 (or higher) via `pip` following https://pytorch.org/. If you have a PyTorch version lower than 2.5.1 in your current environment, the installation command above will try to upgrade it to the latest PyTorch version using `pip`.
-2. The step above requires compiling a custom CUDA kernel with the `nvcc` compiler. If it isn't already available on your machine, please install the [CUDA toolkits](https://developer.nvidia.com/cuda-toolkit-archive) with a version that matches your PyTorch CUDA version.
-3. If you see a message like `Failed to build the SAM 2 CUDA extension` during installation, you can ignore it and still use SAM 2 (some post-processing functionality may be limited, but it doesn't affect the results in most cases).
-
-Please see [`INSTALL.md`](./INSTALL.md) for FAQs on potential issues and solutions.
-
-## Getting Started
-
-### Download Checkpoints
-
-First, we need to download a model checkpoint. All the model checkpoints can be downloaded by running:
+Install CUDA PyTorch. Choose the wheel index that matches your CUDA/driver setup; CUDA 12.8 is used here as an example:
 
 ```bash
-cd checkpoints && \
-./download_ckpts.sh && \
-cd ..
+python -m pip install --upgrade pip
+python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 ```
 
-or individually from:
+Install this repository and the command-line runtime packages:
 
-- [sam2.1_hiera_tiny.pt](https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt)
-- [sam2.1_hiera_small.pt](https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt)
-- [sam2.1_hiera_base_plus.pt](https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_base_plus.pt)
-- [sam2.1_hiera_large.pt](https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt)
-
-(note that these are the improved checkpoints denoted as SAM 2.1; see [Model Description](#model-description) for details.)
-
-Then SAM 2 can be used in a few lines as follows for image and video prediction.
-
-### Image prediction
-
-SAM 2 has all the capabilities of [SAM](https://github.com/facebookresearch/segment-anything) on static images, and we provide image prediction APIs that closely resemble SAM for image use cases. The `SAM2ImagePredictor` class has an easy interface for image prompting.
-
-```python
-import torch
-from sam2.build_sam import build_sam2
-from sam2.sam2_image_predictor import SAM2ImagePredictor
-
-checkpoint = "./checkpoints/sam2.1_hiera_large.pt"
-model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
-predictor = SAM2ImagePredictor(build_sam2(model_cfg, checkpoint))
-
-with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-    predictor.set_image(<your_image>)
-    masks, _, _ = predictor.predict(<input_prompts>)
+```bash
+conda install -c conda-forge ffmpeg -y
+python -m pip install --no-build-isolation -e .
+python -m pip install matplotlib eva-decord opencv-python-headless pillow numpy pyyaml ultralytics
 ```
 
-Please refer to the examples in [image_predictor_example.ipynb](./notebooks/image_predictor_example.ipynb) (also in Colab [here](https://colab.research.google.com/github/facebookresearch/sam2/blob/main/notebooks/image_predictor_example.ipynb)) for static image use cases.
+Download the required SAM2 checkpoint as described in
+[Segment Reviewed Prompt Videos](#segment-reviewed-prompt-videos).
 
-SAM 2 also supports automatic mask generation on images just like SAM. Please see [automatic_mask_generator_example.ipynb](./notebooks/automatic_mask_generator_example.ipynb) (also in Colab [here](https://colab.research.google.com/github/facebookresearch/sam2/blob/main/notebooks/automatic_mask_generator_example.ipynb)) for automatic mask generation in images.
+## Seed Annotations
 
-### Video prediction
+Start from a small set of seed videos that already have SAM2 segmentation outputs. The expected task directory is:
 
-For promptable segmentation and tracking in videos, we provide a video predictor with APIs for example to add prompts and propagate masklets throughout a video. SAM 2 supports video inference on multiple objects and uses an inference state to keep track of the interactions in each video.
-
-```python
-import torch
-from sam2.build_sam import build_sam2_video_predictor
-
-checkpoint = "./checkpoints/sam2.1_hiera_large.pt"
-model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
-predictor = build_sam2_video_predictor(model_cfg, checkpoint)
-
-with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-    state = predictor.init_state(<your_video>)
-
-    # add new prompts and instantly get the output on the same frame
-    frame_idx, object_ids, masks = predictor.add_new_points_or_box(state, <your_prompts>):
-
-    # propagate the prompts to get masklets throughout the video
-    for frame_idx, object_ids, masks in predictor.propagate_in_video(state):
-        ...
+```text
+outputs/task1/
+  labels.txt
+  file-*_sam2_masks/
+    sam2_prompts.json
+    object_mask_frames/*.png
+    mask_frames/*.png
+    mask_visual_frames/*.png
+    mask_visual.mp4
 ```
 
-Please refer to the examples in [video_predictor_example.ipynb](./notebooks/video_predictor_example.ipynb) (also in Colab [here](https://colab.research.google.com/github/facebookresearch/sam2/blob/main/notebooks/video_predictor_example.ipynb)) for details on how to add click or box prompts, make refinements, and track multiple objects in videos.
+`labels.txt` defines the object classes, one class per line. `sam2_prompts.json` records the source video path and object metadata. `object_mask_frames` stores per-object mask PNGs used to build the YOLO dataset.
 
-## Load from 🤗 Hugging Face
+Seed annotations can be produced by any SAM2 prompting workflow as long as this output structure is preserved.
 
-Alternatively, models can also be loaded from [Hugging Face](https://huggingface.co/models?search=facebook/sam2) (requires `pip install huggingface_hub`).
+For targets that disappear or closely resemble a static background, an object may
+define inclusive `visible_ranges`, for example `"visible_ranges": [[170, 440],
+[900, 1100]]`. Frames outside those ranges are exported as empty object masks.
 
-For image prediction:
+## Segment Reviewed Prompt Videos
 
-```python
-import torch
-from sam2.sam2_image_predictor import SAM2ImagePredictor
+The reviewed prompt files under `temp/<dataset>/prompts/json` already contain
+the source video path, object IDs, and box prompts on selected frames. Validate
+them first:
 
-predictor = SAM2ImagePredictor.from_pretrained("facebook/sam2-hiera-large")
-
-with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-    predictor.set_image(<your_image>)
-    masks, _, _ = predictor.predict(<input_prompts>)
+```bash
+python tools/sam2_prompts_to_masks.py \
+  --prompt-root /home/qihan/data/sam2/segdata/temp/newdata_3object/prompts/json \
+  --output-root /home/qihan/data/sam2/segdata/temp/newdata_3object/sam2_masks \
+  --validate-only
 ```
 
-For video prediction:
+Download only the SAM2.1 Base+ checkpoint without using proxy variables:
 
-```python
-import torch
-from sam2.sam2_video_predictor import SAM2VideoPredictor
-
-predictor = SAM2VideoPredictor.from_pretrained("facebook/sam2-hiera-large")
-
-with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-    state = predictor.init_state(<your_video>)
-
-    # add new prompts and instantly get the output on the same frame
-    frame_idx, object_ids, masks = predictor.add_new_points_or_box(state, <your_prompts>):
-
-    # propagate the prompts to get masklets throughout the video
-    for frame_idx, object_ids, masks in predictor.propagate_in_video(state):
-        ...
+```bash
+env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+    -u http_proxy -u https_proxy -u all_proxy \
+  wget -P checkpoints \
+  https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_base_plus.pt
 ```
 
-## Model Description
+Run SAM2 on all prompt JSON files without Gradio:
 
-### SAM 2.1 checkpoints
-
-The table below shows the improved SAM 2.1 checkpoints released on September 29, 2024.
-|      **Model**       | **Size (M)** |    **Speed (FPS)**     | **SA-V test (J&F)** | **MOSE val (J&F)** | **LVOS v2 (J&F)** |
-| :------------------: | :----------: | :--------------------: | :-----------------: | :----------------: | :---------------: |
-|   sam2.1_hiera_tiny <br /> ([config](sam2/configs/sam2.1/sam2.1_hiera_t.yaml), [checkpoint](https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt))    |     38.9     |          91.2          |        76.5         |        71.8        |       77.3        |
-|   sam2.1_hiera_small <br /> ([config](sam2/configs/sam2.1/sam2.1_hiera_s.yaml), [checkpoint](https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt))   |      46      |          84.8          |        76.6         |        73.5        |       78.3        |
-| sam2.1_hiera_base_plus <br /> ([config](sam2/configs/sam2.1/sam2.1_hiera_b+.yaml), [checkpoint](https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_base_plus.pt)) |     80.8     |        64.1          |        78.2         |        73.7        |       78.2        |
-|   sam2.1_hiera_large <br /> ([config](sam2/configs/sam2.1/sam2.1_hiera_l.yaml), [checkpoint](https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt))   |    224.4     |          39.5          |        79.5         |        74.6        |       80.6        |
-
-### SAM 2 checkpoints
-
-The previous SAM 2 checkpoints released on July 29, 2024 can be found as follows:
-
-|      **Model**       | **Size (M)** |    **Speed (FPS)**     | **SA-V test (J&F)** | **MOSE val (J&F)** | **LVOS v2 (J&F)** |
-| :------------------: | :----------: | :--------------------: | :-----------------: | :----------------: | :---------------: |
-|   sam2_hiera_tiny <br /> ([config](sam2/configs/sam2/sam2_hiera_t.yaml), [checkpoint](https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_tiny.pt))   |     38.9     |          91.5          |        75.0         |        70.9        |       75.3        |
-|   sam2_hiera_small <br /> ([config](sam2/configs/sam2/sam2_hiera_s.yaml), [checkpoint](https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_small.pt))   |      46      |          85.6          |        74.9         |        71.5        |       76.4        |
-| sam2_hiera_base_plus <br /> ([config](sam2/configs/sam2/sam2_hiera_b+.yaml), [checkpoint](https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_base_plus.pt)) |     80.8     |     64.8    |        74.7         |        72.8        |       75.8        |
-|   sam2_hiera_large <br /> ([config](sam2/configs/sam2/sam2_hiera_l.yaml), [checkpoint](https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_large.pt))   |    224.4     | 39.7 |        76.0         |        74.6        |       79.8        |
-
-Speed measured on an A100 with `torch 2.5.1, cuda 12.4`. See `benchmark.py` for an example on benchmarking (compiling all the model components). Compiling only the image encoder can be more flexible and also provide (a smaller) speed-up (set `compile_image_encoder: True` in the config).
-## Segment Anything Video Dataset
-
-See [sav_dataset/README.md](sav_dataset/README.md) for details.
-
-## Training SAM 2
-
-You can train or fine-tune SAM 2 on custom datasets of images, videos, or both. Please check the training [README](training/README.md) on how to get started.
-
-## Web demo for SAM 2
-
-We have released the frontend + backend code for the SAM 2 web demo (a locally deployable version similar to https://sam2.metademolab.com/demo). Please see the web demo [README](demo/README.md) for details.
-
-## License
-
-The SAM 2 model checkpoints, SAM 2 demo code (front-end and back-end), and SAM 2 training code are licensed under [Apache 2.0](./LICENSE), however the [Inter Font](https://github.com/rsms/inter?tab=OFL-1.1-1-ov-file) and [Noto Color Emoji](https://github.com/googlefonts/noto-emoji) used in the SAM 2 demo code are made available under the [SIL Open Font License, version 1.1](https://openfontlicense.org/open-font-license-official-text/).
-
-## Contributing
-
-See [contributing](CONTRIBUTING.md) and the [code of conduct](CODE_OF_CONDUCT.md).
-
-## Contributors
-
-The SAM 2 project was made possible with the help of many contributors (alphabetical):
-
-Karen Bergan, Daniel Bolya, Alex Bosenberg, Kai Brown, Vispi Cassod, Christopher Chedeau, Ida Cheng, Luc Dahlin, Shoubhik Debnath, Rene Martinez Doehner, Grant Gardner, Sahir Gomez, Rishi Godugu, Baishan Guo, Caleb Ho, Andrew Huang, Somya Jain, Bob Kamma, Amanda Kallet, Jake Kinney, Alexander Kirillov, Shiva Koduvayur, Devansh Kukreja, Robert Kuo, Aohan Lin, Parth Malani, Jitendra Malik, Mallika Malhotra, Miguel Martin, Alexander Miller, Sasha Mitts, William Ngan, George Orlin, Joelle Pineau, Kate Saenko, Rodrick Shepard, Azita Shokrpour, David Soofian, Jonathan Torres, Jenny Truong, Sagar Vaze, Meng Wang, Claudette Ward, Pengchuan Zhang.
-
-Third-party code: we use a GPU-based connected component algorithm adapted from [`cc_torch`](https://github.com/zsef123/Connected_components_PyTorch) (with its license in [`LICENSE_cctorch`](./LICENSE_cctorch)) as an optional post-processing step for the mask predictions.
-
-## Citing SAM 2
-
-If you use SAM 2 or the SA-V dataset in your research, please use the following BibTeX entry.
-
-```bibtex
-@article{ravi2024sam2,
-  title={SAM 2: Segment Anything in Images and Videos},
-  author={Ravi, Nikhila and Gabeur, Valentin and Hu, Yuan-Ting and Hu, Ronghang and Ryali, Chaitanya and Ma, Tengyu and Khedr, Haitham and R{\"a}dle, Roman and Rolland, Chloe and Gustafson, Laura and Mintun, Eric and Pan, Junting and Alwala, Kalyan Vasudev and Carion, Nicolas and Wu, Chao-Yuan and Girshick, Ross and Doll{\'a}r, Piotr and Feichtenhofer, Christoph},
-  journal={arXiv preprint arXiv:2408.00714},
-  url={https://arxiv.org/abs/2408.00714},
-  year={2024}
-}
+```bash
+python tools/sam2_prompts_to_masks.py \
+  --prompt-root /home/qihan/data/sam2/segdata/temp/newdata_3object/prompts/json \
+  --output-root /home/qihan/data/sam2/segdata/temp/newdata_3object/sam2_masks \
+  --sam2-checkpoint checkpoints/sam2.1_hiera_base_plus.pt \
+  --sam2-config configs/sam2.1/sam2.1_hiera_b+.yaml
 ```
+
+Add `--limit 1` for a one-video test. Add `--offload-state-to-cpu` if GPU
+memory is insufficient. Existing completed outputs are skipped; use
+`--overwrite` to regenerate them.
+
+If the optional `sam2._C` CUDA extension is unavailable, the command-line tool
+disables only small-hole filling and continues with the remaining SAM2
+post-processing. This does not normally require rebuilding the environment.
+
+Each video output contains:
+
+```text
+file-*_sam2_masks/
+  sam2_prompts.json
+  mask_frames/             # class-ID PNG: 0=background, 1/2/...=object ID
+  mask_visual_frames/      # colored masks for inspection
+  mask_visual.mp4          # colored-mask video without the source image
+  object_mask_frames/      # one 0/255 binary mask per object and frame
+  complete.json
+```
+
+## Train YOLO From SAM2 Masks
+
+Convert exported SAM2 object masks into a YOLO detection dataset:
+
+```bash
+/home/qihan/miniconda3/envs/sam2/bin/python \
+  tools/yolo_sam2/convert_sam2_masks_to_yolo.py \
+  --input /home/qihan/data/sam2/segdata/temp/newdata_3object/sam2_masks \
+  --output /home/qihan/data/sam2/segdata/temp/newdata_3object/yolo_detect_random \
+  --labels /home/qihan/data/sam2/segdata/origin/newdata_3object/labels.txt \
+  --task detect \
+  --split-mode random \
+  --train-ratio 0.8 \
+  --seed 42 \
+  --frame-stride 3 \
+  --quality-filter \
+  --overwrite
+```
+
+The converter recursively combines front/side videos from all tasks, then
+globally shuffles frames instead of splitting by task. Its default quality
+filter removes fragmented masks and abnormal mask-area jumps. The full split
+and rejection log is stored in `manifest.json`.
+
+This dataset uses four flat classes: `occluder`, `object`, `region`, and `tool`.
+Cube, paper ball, and screw remain one `object` class because the detector is
+used to generate class-agnostic SAM2 prompts. Use separate flat YOLO classes
+only if a later application must distinguish those object types.
+
+Train YOLO:
+
+```bash
+/home/qihan/miniconda3/envs/sam2/bin/python tools/yolo_sam2/train_yolo.py \
+  --data /home/qihan/data/sam2/segdata/temp/newdata_3object/yolo_detect_random/data.yaml \
+  --model yolo11n.pt \
+  --epochs 100 \
+  --imgsz 640 \
+  --batch 64 \
+  --patience 20 \
+  --device 0 \
+  --workers 8 \
+  --seed 42 \
+  --project /home/qihan/data/sam2/segdata/temp/newdata_3object/runs/yolo \
+  --name newdata_3object_detect
+```
+
+The trained detector is usually saved at:
+
+```text
+/home/qihan/data/sam2/segdata/temp/newdata_3object/runs/yolo/newdata_3object_detect/weights/best.pt
+```
+
+## Generate the Final LeRobot Dataset
+
+Generate YOLO prompts for every front and side video:
+
+```bash
+env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+    -u http_proxy -u https_proxy -u all_proxy \
+  /home/qihan/miniconda3/envs/sam2/bin/python \
+  tools/yolo_sam2/generate_yolo_prompts.py \
+  --dataset-root /home/qihan/data/sam2/segdata/origin/newdata_3object \
+  --video-key observation.images.front \
+  --video-key observation.images.side \
+  --yolo-weights /home/qihan/data/sam2/segdata/temp/newdata_3object/runs/yolo/newdata_3object_detect/weights/best.pt \
+  --labels /home/qihan/data/sam2/segdata/origin/newdata_3object/labels.txt \
+  --output-root /home/qihan/data/sam2/segdata/temp/newdata_3object/final_work/prompts \
+  --device 0 \
+  --sample-stride 5 \
+  --prompts-per-class 3 \
+  --side-tool-conf 0.50
+```
+
+Run SAM2 propagation. Completed videos are skipped automatically:
+
+```bash
+python tools/sam2_prompts_to_masks.py \
+  --prompt-root /home/qihan/data/sam2/segdata/temp/newdata_3object/final_work/prompts \
+  --output-root /home/qihan/data/sam2/segdata/temp/newdata_3object/final_work/sam2_masks \
+  --sam2-checkpoint checkpoints/sam2.1_hiera_base_plus.pt \
+  --sam2-config configs/sam2.1/sam2.1_hiera_b+.yaml \
+  --device cuda:0
+```
+
+After all 600 videos contain `complete.json`, export a complete LeRobot dataset:
+
+```bash
+python tools/yolo_sam2/convert_sam2_masks_to_lerobot.py \
+  --source-root /home/qihan/data/sam2/segdata/origin/newdata_3object \
+  --seg-root /home/qihan/data/sam2/segdata/temp/newdata_3object/final_work/sam2_masks \
+  --labels /home/qihan/data/sam2/segdata/origin/newdata_3object/labels.txt \
+  --output-root /home/qihan/data/sam2/segdata/final/newdata_3object \
+  --video-key observation.images.front \
+  --video-key observation.images.side \
+  --crf 18
+```
+
+The final dataset adds `front_occluder`, `front_object`, `front_region`,
+`front_tool`, and the corresponding four side-view video features.
+
+## Key Files
+
+- `tools/yolo_sam2/convert_sam2_masks_to_yolo.py`: convert SAM2 masks to YOLO labels.
+- `tools/yolo_sam2/train_yolo.py`: train an Ultralytics YOLO detector.
+- `tools/yolo_sam2/generate_yolo_prompts.py`: generate multi-frame prompts for all dataset videos.
+- `tools/yolo_sam2/yolo_to_sam2.py`: run YOLO prompt generation and SAM2 segmentation for one video.
+- `tools/yolo_sam2/convert_sam2_masks_to_lerobot.py`: add front/side mask videos to a LeRobot dataset copy.
+- `tools/yolo_sam2/README.md`: more detailed command examples.
+
+## Citation
+
+If you use the SAM2 model or checkpoints, cite the original SAM2 work and follow the original license:
+<https://github.com/facebookresearch/sam2>

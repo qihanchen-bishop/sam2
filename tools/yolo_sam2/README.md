@@ -16,124 +16,142 @@ For training, install a CUDA-enabled PyTorch build if you want GPU acceleration.
 ## 1. Convert SAM2 Masks to YOLO Detect Data
 
 ```bash
-conda run -n sam2 python tools/yolo_sam2/convert_sam2_masks_to_yolo.py \
-  --input outputs/task1 \
-  --output datasets/task1_yolo_detect \
+/home/qihan/miniconda3/envs/sam2/bin/python \
+  tools/yolo_sam2/convert_sam2_masks_to_yolo.py \
+  --input /home/qihan/data/sam2/segdata/temp/newdata_3object/sam2_masks \
+  --output /home/qihan/data/sam2/segdata/temp/newdata_3object/yolo_detect_random \
+  --labels /home/qihan/data/sam2/segdata/origin/newdata_3object/labels.txt \
   --task detect \
   --split-mode random \
   --train-ratio 0.8 \
   --seed 42 \
+  --frame-stride 3 \
+  --min-mask-pixels 20 \
+  --min-box-size 2 \
+  --quality-filter \
   --overwrite
 ```
 
-The converter reads:
+The converter recursively discovers all `file-*_sam2_masks` directories under
+the input root, including both front and side views. It reads:
 
-- `outputs/task1/labels.txt`
-- `outputs/task1/file-*_sam2_masks/sam2_prompts.json`
-- `outputs/task1/file-*_sam2_masks/object_mask_frames/*_obj*.png`
+- the class name before `:` or `：` on each line of `labels.txt`
+- `file-*_sam2_masks/sam2_prompts.json`
+- `file-*_sam2_masks/object_mask_frames/*_obj*.png`
 
 It extracts clean images from the original videos listed in `sam2_prompts.json`;
-it does not train on `overlay_frames`.
+it does not train on `mask_visual_frames`.
+
+Frames are sampled every three frames and then globally shuffled with seed 42.
+The train/validation split is not grouped by task or camera view. The default
+quality filter rejects fragmented masks, masks covering most of the image, and
+large global or temporal area spikes. If any object mask is rejected, the whole
+sampled frame is removed. Review exact decisions in `manifest.json`.
 
 The generated dataset is:
 
 ```text
-datasets/task1_yolo_detect/
+/home/qihan/data/sam2/segdata/temp/newdata_3object/yolo_detect_random/
   images/train/*.jpg
   images/val/*.jpg
   labels/train/*.txt
   labels/val/*.txt
   data.yaml
+  labels.txt
   manifest.json
 ```
 
-For a later segmentation baseline, generate polygon labels with:
-
-```bash
-conda run -n sam2 python tools/yolo_sam2/convert_sam2_masks_to_yolo.py \
-  --input outputs/task1 \
-  --output datasets/task1_yolo_segment \
-  --task segment \
-  --overwrite
-```
+The current detector uses four flat classes: `occluder`, `object`, `region`, and
+`tool`. Cube, paper ball, and screw are all task-specific appearances of
+`object`; hierarchical labels are not needed for generating SAM2 prompts.
 
 ## 2. Train YOLO Detect
 
 ```bash
-conda run -n sam2 python tools/yolo_sam2/train_yolo.py \
-  --data datasets/task1_yolo_detect/data.yaml \
-  --model yolo26n.pt \
+/home/qihan/miniconda3/envs/sam2/bin/python tools/yolo_sam2/train_yolo.py \
+  --data /home/qihan/data/sam2/segdata/temp/newdata_3object/yolo_detect_random/data.yaml \
+  --model yolo11n.pt \
   --epochs 100 \
   --imgsz 640 \
-  --batch auto \
+  --batch 64 \
   --patience 20 \
-  --project runs/yolo \
-  --name task1_detect
+  --device 0 \
+  --workers 8 \
+  --seed 42 \
+  --project /home/qihan/data/sam2/segdata/temp/newdata_3object/runs/yolo \
+  --name newdata_3object_detect
 ```
 
-Use `--model yolo11n.pt` or `--model yolo11s.pt` if your installed Ultralytics
-version does not provide YOLO26 weights.
+The best checkpoint is written to
+`runs/yolo/newdata_3object_detect/weights/best.pt` under the selected project.
 
-Smoke test:
+## 3. Segment the Full LeRobot Dataset
+
+Generate three temporally separated YOLO box prompts per detected class for all
+front and side videos:
 
 ```bash
-conda run -n sam2 python tools/yolo_sam2/train_yolo.py \
-  --data datasets/task1_yolo_detect/data.yaml \
-  --model yolo26n.pt \
-  --epochs 1 \
-  --imgsz 640 \
-  --batch 2 \
-  --name task1_detect_smoke \
-  --exist-ok
+env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+    -u http_proxy -u https_proxy -u all_proxy \
+  /home/qihan/miniconda3/envs/sam2/bin/python \
+  tools/yolo_sam2/generate_yolo_prompts.py \
+  --dataset-root /home/qihan/data/sam2/segdata/origin/newdata_3object \
+  --video-key observation.images.front \
+  --video-key observation.images.side \
+  --yolo-weights /home/qihan/data/sam2/segdata/temp/newdata_3object/runs/yolo/newdata_3object_detect/weights/best.pt \
+  --labels /home/qihan/data/sam2/segdata/origin/newdata_3object/labels.txt \
+  --output-root /home/qihan/data/sam2/segdata/temp/newdata_3object/final_work/prompts \
+  --device 0 \
+  --sample-stride 5 \
+  --prompts-per-class 3 \
+  --conf 0.25 \
+  --side-tool-conf 0.50
 ```
 
-## 3. Use YOLO Boxes as SAM2 Prompts
+The higher side-view tool threshold reduces false prompts on the static black
+background. Prompt generation skips existing JSON files unless `--overwrite`
+is supplied.
+
+Validate and propagate all prompts with one SAM2 model load:
 
 ```bash
-conda run -n sam2 python tools/yolo_sam2/yolo_to_sam2.py \
-  --video /path/to/new_video.mp4 \
-  --yolo-weights runs/yolo/task1_detect/weights/best.pt \
+python tools/sam2_prompts_to_masks.py \
+  --prompt-root /home/qihan/data/sam2/segdata/temp/newdata_3object/final_work/prompts \
+  --output-root /home/qihan/data/sam2/segdata/temp/newdata_3object/final_work/sam2_masks \
+  --validate-only
+
+python tools/sam2_prompts_to_masks.py \
+  --prompt-root /home/qihan/data/sam2/segdata/temp/newdata_3object/final_work/prompts \
+  --output-root /home/qihan/data/sam2/segdata/temp/newdata_3object/final_work/sam2_masks \
   --sam2-checkpoint checkpoints/sam2.1_hiera_base_plus.pt \
   --sam2-config configs/sam2.1/sam2.1_hiera_b+.yaml \
-  --labels outputs/task1/labels.txt \
-  --output outputs/new_video_yolo_sam2 \
-  --conf 0.25 \
-  --overwrite
+  --device cuda:0
 ```
 
-Add `--add-center-point` to include one positive point at each YOLO box center
-in addition to the box prompt.
+Completed videos are skipped automatically, so the propagation command is safe
+to resume after interruption. Do not add `--overwrite` for a normal resume.
 
-The output mirrors the existing SAM2 output style:
-
-```text
-outputs/new_video_yolo_sam2/
-  mask_frames/*.png
-  object_mask_frames/*_obj*.png
-  overlay_frames/*.jpg
-  overlay.mp4
-  sam2_prompts.json
-```
-
-## Gradio App Integration
-
-The same flow is also available in `apps/sam2_video_gradio_app.py`.
+Confirm that both stages contain 600 completed videos:
 
 ```bash
-conda run -n sam2 python apps/sam2_video_gradio_app.py
+find /home/qihan/data/sam2/segdata/temp/newdata_3object/final_work/prompts \
+  -name sam2_prompts.json | wc -l
+find /home/qihan/data/sam2/segdata/temp/newdata_3object/final_work/sam2_masks \
+  -name complete.json | wc -l
 ```
 
-After loading a video/task, open **YOLO 自动 Prompt**:
+After both counts reach 600, create the final LeRobot dataset copy:
 
-- `YOLO 权重`: usually `runs/yolo/task1_detect/weights/best.pt`
-- `YOLO 置信度阈值`: start with `0.25`; lower it if a class is missed
-- `同时添加 box 中心正点`: adds one positive click at each detected box center
-- `覆盖当前标注`: replace current prompts with YOLO-generated prompts
-- `YOLO 生成框 Prompt`: generate prompts only, so you can inspect/refine them
-- `YOLO 生成 Prompt 并分割导出`: generate prompts, run SAM2, and export masks/overlay
+```bash
+python tools/yolo_sam2/convert_sam2_masks_to_lerobot.py \
+  --source-root /home/qihan/data/sam2/segdata/origin/newdata_3object \
+  --seg-root /home/qihan/data/sam2/segdata/temp/newdata_3object/final_work/sam2_masks \
+  --labels /home/qihan/data/sam2/segdata/origin/newdata_3object/labels.txt \
+  --output-root /home/qihan/data/sam2/segdata/final/newdata_3object \
+  --video-key observation.images.front \
+  --video-key observation.images.side \
+  --crf 18
+```
 
-For unattended processing, open **批量自动分割** and click
-`分割当前目录剩余视频`. The app scans the current video directory, skips videos
-that already have an overlay and `mask_frames` under the selected task, then
-processes the remaining videos in order. For each video it creates YOLO box
-prompts at the 3/5 and 4/5 frame positions and then runs SAM2 propagation.
+The final copy preserves the original LeRobot dataset and adds eight video
+features: four binary masks for each of the front and side views.

@@ -145,17 +145,17 @@ def write_outputs(output_dir: Path, frames: list[Path], video_segments: dict[int
 
     mask_dir = output_dir / "mask_frames"
     obj_mask_dir = output_dir / "object_mask_frames"
-    overlay_dir = output_dir / "overlay_frames"
+    visual_dir = output_dir / "mask_visual_frames"
     mask_dir.mkdir(parents=True, exist_ok=True)
     obj_mask_dir.mkdir(parents=True, exist_ok=True)
-    overlay_dir.mkdir(parents=True, exist_ok=True)
+    visual_dir.mkdir(parents=True, exist_ok=True)
 
     first_frame = cv2.imread(str(frames[0]))
     if first_frame is None:
         raise RuntimeError(f"Failed to read frame {frames[0]}")
     height, width = first_frame.shape[:2]
     video_writer = cv2.VideoWriter(
-        str(output_dir / "overlay.mp4"),
+        str(output_dir / "mask_visual.mp4"),
         cv2.VideoWriter_fourcc(*"mp4v"),
         30,
         (width, height),
@@ -166,7 +166,7 @@ def write_outputs(output_dir: Path, frames: list[Path], video_segments: dict[int
         if frame is None:
             raise RuntimeError(f"Failed to read frame {frame_path}")
         combined = np.zeros((height, width), dtype=np.uint8)
-        overlay = frame.copy()
+        visual = np.zeros_like(frame)
         per_obj = video_segments.get(frame_idx, {})
         for obj_id, logits in sorted(per_obj.items()):
             mask = (logits > mask_threshold).astype(np.uint8)
@@ -177,12 +177,10 @@ def write_outputs(output_dir: Path, frames: list[Path], video_segments: dict[int
             binary = (mask * 255).astype(np.uint8)
             save_mask_png(obj_mask_dir / f"{frame_idx:05d}_obj{obj_id:03d}.png", binary)
             color = DEFAULT_COLORS.get(obj_id, (255, 255, 255))
-            color_layer = np.zeros_like(frame)
-            color_layer[:, :] = color[::-1]
-            overlay = np.where(mask[..., None] > 0, (0.55 * overlay + 0.45 * color_layer).astype(np.uint8), overlay)
+            visual[mask > 0] = color[::-1]
         save_mask_png(mask_dir / f"{frame_idx:05d}.png", combined)
-        cv2.imwrite(str(overlay_dir / f"{frame_idx:05d}.jpg"), overlay)
-        video_writer.write(overlay)
+        cv2.imwrite(str(visual_dir / f"{frame_idx:05d}.png"), visual)
+        video_writer.write(visual)
     video_writer.release()
 
 

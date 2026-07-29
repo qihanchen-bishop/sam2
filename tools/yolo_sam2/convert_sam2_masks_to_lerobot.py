@@ -1,90 +1,207 @@
 #!/usr/bin/env python3
-"""Add SAM2 mask videos to a LeRobot dataset copy."""
+"""Add multi-view SAM2 mask videos to a LeRobot dataset copy."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import math
+import re
 import shutil
 import subprocess
+import sys
+from collections import defaultdict
 from pathlib import Path
-
-
-DEFAULT_CLASS_KEY_MAP = {
-    "occluder": "observation.images.occluder",
-    "region": "observation.images.region",
-    "leftarm": "observation.images.left_arm",
-    "left_arm": "observation.images.left_arm",
-    "rightarm": "observation.images.right_arm",
-    "right_arm": "observation.images.right_arm",
-    "object": "observation.images.object",
-}
+from typing import Any
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, required=True)
-    parser.add_argument("--seg-task-dir", type=Path, required=True)
+    parser.add_argument(
+        "--seg-root",
+        "--seg-task-dir",
+        dest="seg_root",
+        type=Path,
+        required=True,
+        help="Root recursively containing file-*_sam2_masks outputs.",
+    )
+    parser.add_argument("--labels", type=Path)
     parser.add_argument("--output-root", type=Path, required=True)
-    parser.add_argument("--rgb-key", default="observation.images.left_front")
+    parser.add_argument(
+        "--video-key",
+        action="append",
+        default=[],
+        help="Source RGB video key to export; repeat for multiple views.",
+    )
     parser.add_argument("--crf", default="18")
+    parser.add_argument("--allow-missing", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
 
-def read_json(path: Path) -> dict:
-    return json.loads(path.read_text())
+def read_json(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
-def write_json(path: Path, data: dict) -> None:
-    path.write_text(json.dumps(data, indent=4) + "\n")
+def write_json(path: Path, data: dict[str, Any]) -> None:
+    path.write_text(
+        json.dumps(data, ensure_ascii=False, indent=4) + "\n",
+        encoding="utf-8",
+    )
 
 
 def read_labels(path: Path) -> list[str]:
-    labels = [line.strip() for line in path.read_text().splitlines() if line.strip()]
+    labels = []
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        name = re.split(r"[:：]", line, maxsplit=1)[0].strip()
+        if name:
+            labels.append(name)
     if not labels:
         raise RuntimeError(f"No labels found in {path}")
+    if len(labels) != len(set(labels)):
+        raise RuntimeError(f"Duplicate labels in {path}: {labels}")
     return labels
 
 
 def normalized_label(label: str) -> str:
-    return label.strip().lower().replace("-", "_").replace(" ", "_")
+    return re.sub(r"[^a-z0-9_]+", "_", label.strip().lower()).strip("_")
+
+
+def find_executable(name: str) -> str:
+    executable = shutil.which(name)
+    if executable:
+        return executable
+    environment_executable = Path(sys.executable).resolve().parent / name
+    if environment_executable.is_file():
+        return str(environment_executable)
+    raise RuntimeError(f"{name} was not found in PATH or the active environment")
+
+
+def resolve_labels_path(
+    requested: Path | None, seg_root: Path, prompt_paths: list[Path]
+) -> Path:
+    candidates = []
+    if requested is not None:
+        candidates.append(requested)
+    candidates.append(seg_root / "labels.txt")
+    for prompt_path in prompt_paths:
+        source = read_json(prompt_path).get("labels_source")
+        if source:
+            candidates.append(Path(source))
+    for path in candidates:
+        if path.is_file():
+            return path.resolve()
+    raise RuntimeError("Could not find labels.txt; pass --labels explicitly")
 
 
 def copy_dataset(source_root: Path, output_root: Path, overwrite: bool) -> None:
     if output_root.exists():
         if not overwrite:
-            raise RuntimeError(f"{output_root} already exists; pass --overwrite to replace it")
+            raise RuntimeError(
+                f"{output_root} already exists; pass --overwrite to replace it"
+            )
         shutil.rmtree(output_root)
 
-    def ignore(_dir: str, names: list[str]) -> set[str]:
-        return {name for name in names if name in {"seg", "yolo", "outputs", "runs"}}
+    def ignore(_directory: str, names: list[str]) -> set[str]:
+        return {
+            name
+            for name in names
+            if name in {"seg", "yolo", "outputs", "runs", "temp", "final"}
+        }
 
     shutil.copytree(source_root, output_root, ignore=ignore)
 
 
-def discover_sam2_outputs(seg_task_dir: Path) -> list[dict]:
+def infer_video_key(video_path: Path, source_root: Path) -> str:
+    try:
+        relative = video_path.resolve().relative_to((source_root / "videos").resolve())
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Video {video_path} is not under {source_root / 'videos'}"
+        ) from exc
+    return relative.parts[0]
+
+
+def discover_sam2_outputs(
+    seg_root: Path, source_root: Path, requested_keys: list[str]
+) -> list[dict[str, Any]]:
     records = []
-    for prompt_path in sorted(seg_task_dir.glob("file-*_sam2_masks/sam2_prompts.json")):
+    seen = set()
+    for prompt_path in sorted(seg_root.rglob("file-*_sam2_masks/sam2_prompts.json")):
         prompt = read_json(prompt_path)
-        stem = prompt_path.parent.name.removesuffix("_sam2_masks")
-        file_index = int(stem.removeprefix("file-"))
+        video_path = Path(prompt["video_path"]).resolve()
+        video_key = prompt.get("video_key") or infer_video_key(video_path, source_root)
+        if requested_keys and video_key not in requested_keys:
+            continue
+        chunk_index = int(
+            prompt.get(
+                "chunk_index", video_path.parent.name.removeprefix("chunk-")
+            )
+        )
+        file_index = int(
+            prompt.get("file_index", video_path.stem.removeprefix("file-"))
+        )
+        identity = (video_key, chunk_index, file_index)
+        if identity in seen:
+            raise RuntimeError(f"Duplicate SAM2 output for {identity}: {prompt_path}")
+        seen.add(identity)
         mask_dir = prompt_path.parent / "mask_frames"
         if not mask_dir.is_dir():
             raise RuntimeError(f"Missing mask_frames directory: {mask_dir}")
+        frame_count = int(prompt.get("frame_count", 0))
+        if frame_count <= 0:
+            complete_path = prompt_path.parent / "complete.json"
+            if complete_path.is_file():
+                frame_count = int(read_json(complete_path).get("frame_count", 0))
+        if frame_count <= 0:
+            raise RuntimeError(f"Missing frame_count in {prompt_path}")
         records.append(
             {
-                "stem": stem,
+                "video_key": video_key,
+                "video_path": video_path,
+                "chunk_index": chunk_index,
                 "file_index": file_index,
-                "chunk_index": 0,
-                "frame_count": int(prompt["frame_count"]),
+                "frame_count": frame_count,
                 "mask_dir": mask_dir,
             }
         )
     if not records:
-        raise RuntimeError(f"No file-*_sam2_masks/sam2_prompts.json found under {seg_task_dir}")
+        raise RuntimeError(f"No SAM2 outputs found under {seg_root}")
     return records
+
+
+def expected_source_videos(
+    source_root: Path, requested_keys: list[str]
+) -> set[tuple[str, int, int]]:
+    videos_root = source_root / "videos"
+    available_keys = sorted(path.name for path in videos_root.iterdir() if path.is_dir())
+    keys = requested_keys or available_keys
+    missing_keys = sorted(set(keys) - set(available_keys))
+    if missing_keys:
+        raise RuntimeError(
+            f"Unknown video keys {missing_keys}; available keys: {available_keys}"
+        )
+    expected = set()
+    for video_key in keys:
+        for path in (videos_root / video_key).glob("chunk-*/*.mp4"):
+            expected.add(
+                (
+                    video_key,
+                    int(path.parent.name.removeprefix("chunk-")),
+                    int(path.stem.removeprefix("file-")),
+                )
+            )
+    return expected
+
+
+def output_video_key(source_key: str, label: str) -> str:
+    prefix = "observation.images."
+    view = source_key.removeprefix(prefix).replace(".", "_")
+    return f"{prefix}{view}_{normalized_label(label)}"
 
 
 def encode_binary_mask_video(
@@ -100,8 +217,8 @@ def encode_binary_mask_video(
     from PIL import Image
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        "ffmpeg",
+    command = [
+        find_executable("ffmpeg"),
         "-hide_banner",
         "-loglevel",
         "error",
@@ -128,25 +245,25 @@ def encode_binary_mask_video(
 
     positive_pixels = 0
     total_pixels = len(mask_paths) * width * height
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-    assert proc.stdin is not None
+    process = subprocess.Popen(command, stdin=subprocess.PIPE)
+    assert process.stdin is not None
     try:
         for mask_path in mask_paths:
             mask = Image.open(mask_path).convert("L")
             if mask.size != (width, height):
                 mask = mask.resize((width, height), Image.Resampling.NEAREST)
-            binary = (np.asarray(mask, dtype=np.uint8) == class_id)
+            binary = np.asarray(mask, dtype=np.uint8) == class_id
             positive_pixels += int(binary.sum())
             frame = np.repeat((binary.astype(np.uint8) * 255)[:, :, None], 3, axis=2)
-            proc.stdin.write(frame.tobytes())
+            process.stdin.write(frame.tobytes())
     finally:
-        proc.stdin.close()
-    if proc.wait() != 0:
+        process.stdin.close()
+    if process.wait() != 0:
         raise RuntimeError(f"ffmpeg failed while writing {output_path}")
     return positive_pixels, total_pixels
 
 
-def video_feature(width: int, height: int, fps: int) -> dict:
+def video_feature(width: int, height: int, fps: int) -> dict[str, Any]:
     return {
         "dtype": "video",
         "shape": [height, width, 3],
@@ -164,20 +281,17 @@ def video_feature(width: int, height: int, fps: int) -> dict:
     }
 
 
-def mask_stats(positive_pixels: int, total_pixels: int) -> dict:
+def mask_stats(positive_pixels: int, total_pixels: int) -> dict[str, Any]:
     if total_pixels <= 0:
         raise RuntimeError("Cannot compute stats for zero pixels")
     mean = positive_pixels / total_pixels
     std = math.sqrt(max(mean * (1.0 - mean), 1e-12))
-    values = [mean, mean, mean]
-    stds = [std, std, std]
-    count = [total_pixels, total_pixels, total_pixels]
     return {
         "min": [0.0, 0.0, 0.0],
         "max": [1.0, 1.0, 1.0],
-        "mean": values,
-        "std": stds,
-        "count": count,
+        "mean": [mean, mean, mean],
+        "std": [std, std, std],
+        "count": [total_pixels, total_pixels, total_pixels],
         "q01": [0.0, 0.0, 0.0],
         "q10": [0.0, 0.0, 0.0],
         "q50": [1.0 if mean >= 0.5 else 0.0] * 3,
@@ -186,101 +300,149 @@ def mask_stats(positive_pixels: int, total_pixels: int) -> dict:
     }
 
 
-def update_episode_video_metadata(output_root: Path, rgb_key: str, video_keys: list[str]) -> None:
+def update_episode_video_metadata(
+    output_root: Path, generated_by_source: dict[str, list[str]]
+) -> None:
     import pandas as pd
 
-    episodes_dir = output_root / "meta" / "episodes"
-    paths = sorted(episodes_dir.glob("chunk-*/*.parquet"))
-    if not paths:
-        raise RuntimeError(f"No episode parquet files found under {episodes_dir}")
-
-    rgb_chunk_col = f"videos/{rgb_key}/chunk_index"
-    rgb_file_col = f"videos/{rgb_key}/file_index"
-    rgb_from_col = f"videos/{rgb_key}/from_timestamp"
-    rgb_to_col = f"videos/{rgb_key}/to_timestamp"
-
-    for path in paths:
-        df = pd.read_parquet(path)
-        if rgb_chunk_col not in df or rgb_file_col not in df:
-            raise RuntimeError(f"{path} does not contain video metadata for {rgb_key}")
-        for video_key in video_keys:
-            df[f"videos/{video_key}/chunk_index"] = df[rgb_chunk_col]
-            df[f"videos/{video_key}/file_index"] = df[rgb_file_col]
-            if rgb_from_col in df:
-                df[f"videos/{video_key}/from_timestamp"] = df[rgb_from_col]
-            if rgb_to_col in df:
-                df[f"videos/{video_key}/to_timestamp"] = df[rgb_to_col]
-        df.to_parquet(path, index=False)
+    episode_paths = sorted((output_root / "meta" / "episodes").glob("chunk-*/*.parquet"))
+    if not episode_paths:
+        raise RuntimeError(
+            f"No episode parquet files found under {output_root / 'meta/episodes'}"
+        )
+    for path in episode_paths:
+        frame = pd.read_parquet(path)
+        for source_key, generated_keys in generated_by_source.items():
+            for suffix in ("chunk_index", "file_index", "from_timestamp", "to_timestamp"):
+                source_column = f"videos/{source_key}/{suffix}"
+                if source_column not in frame:
+                    if suffix in {"chunk_index", "file_index"}:
+                        raise RuntimeError(
+                            f"{path} does not contain required column {source_column}"
+                        )
+                    continue
+                for generated_key in generated_keys:
+                    frame[f"videos/{generated_key}/{suffix}"] = frame[source_column]
+        frame.to_parquet(path, index=False)
 
 
 def main() -> None:
     args = parse_args()
     source_root = args.source_root.resolve()
+    seg_root = args.seg_root.resolve()
     output_root = args.output_root.resolve()
-    seg_task_dir = args.seg_task_dir.resolve()
+    if not source_root.is_dir():
+        raise RuntimeError(f"Source dataset not found: {source_root}")
+    if not seg_root.is_dir():
+        raise RuntimeError(f"SAM2 output root not found: {seg_root}")
 
-    labels = read_labels(seg_task_dir / "labels.txt")
-    label_to_key = {}
-    for label in labels:
-        key = DEFAULT_CLASS_KEY_MAP.get(normalized_label(label))
-        if key is None:
-            raise RuntimeError(
-                f"Label {label!r} is not mapped. Add it to DEFAULT_CLASS_KEY_MAP in this script."
-            )
-        label_to_key[label] = key
+    prompt_paths = sorted(seg_root.rglob("file-*_sam2_masks/sam2_prompts.json"))
+    labels_path = resolve_labels_path(args.labels, seg_root, prompt_paths)
+    labels = read_labels(labels_path)
+    records = discover_sam2_outputs(seg_root, source_root, args.video_key)
+
+    expected = expected_source_videos(source_root, args.video_key)
+    actual = {
+        (record["video_key"], record["chunk_index"], record["file_index"])
+        for record in records
+    }
+    missing = sorted(expected - actual)
+    unexpected = sorted(actual - expected)
+    if unexpected:
+        raise RuntimeError(f"SAM2 outputs do not belong to the source dataset: {unexpected}")
+    if missing and not args.allow_missing:
+        preview = ", ".join(map(str, missing[:10]))
+        raise RuntimeError(
+            f"Missing SAM2 outputs for {len(missing)} videos: {preview}. "
+            "Finish segmentation or pass --allow-missing."
+        )
 
     copy_dataset(source_root, output_root, args.overwrite)
-
     info_path = output_root / "meta" / "info.json"
     stats_path = output_root / "meta" / "stats.json"
     info = read_json(info_path)
     stats = read_json(stats_path)
-    rgb_feature = info["features"][args.rgb_key]
-    height, width = rgb_feature["shape"][:2]
-    fps = int(info.get("fps") or rgb_feature["info"]["video.fps"])
+    fps = int(info["fps"])
 
-    records = discover_sam2_outputs(seg_task_dir)
-    totals = {label_to_key[label]: {"positive": 0, "total": 0} for label in labels}
+    generated_by_source: dict[str, list[str]] = {}
+    totals: dict[str, dict[str, int]] = defaultdict(
+        lambda: {"positive": 0, "total": 0}
+    )
+    dimensions: dict[str, tuple[int, int]] = {}
+    for source_key in sorted({record["video_key"] for record in records}):
+        feature = info["features"].get(source_key)
+        if not feature or feature.get("dtype") != "video":
+            raise RuntimeError(f"Missing source video feature {source_key} in info.json")
+        height, width = map(int, feature["shape"][:2])
+        dimensions[source_key] = (width, height)
+        generated_by_source[source_key] = [
+            output_video_key(source_key, label) for label in labels
+        ]
 
-    for record in records:
+    for index, record in enumerate(records, start=1):
+        width, height = dimensions[record["video_key"]]
         mask_paths = sorted(record["mask_dir"].glob("*.png"))
         if len(mask_paths) != record["frame_count"]:
             raise RuntimeError(
-                f"{record['mask_dir']} has {len(mask_paths)} masks, expected {record['frame_count']}"
+                f"{record['mask_dir']} has {len(mask_paths)} masks, "
+                f"expected {record['frame_count']}"
             )
+        print(
+            f"[{index}/{len(records)}] export {record['video_key']} "
+            f"file-{record['file_index']:03d}",
+            flush=True,
+        )
         for class_id, label in enumerate(labels, start=1):
-            video_key = label_to_key[label]
+            generated_key = output_video_key(record["video_key"], label)
             output_path = (
                 output_root
                 / "videos"
-                / video_key
+                / generated_key
                 / f"chunk-{record['chunk_index']:03d}"
                 / f"file-{record['file_index']:03d}.mp4"
             )
             positive, total = encode_binary_mask_video(
-                mask_paths=mask_paths,
-                class_id=class_id,
-                output_path=output_path,
-                width=width,
-                height=height,
-                fps=fps,
-                crf=args.crf,
+                mask_paths,
+                class_id,
+                output_path,
+                width,
+                height,
+                fps,
+                args.crf,
             )
-            totals[video_key]["positive"] += positive
-            totals[video_key]["total"] += total
-            print(f"wrote {output_path}")
+            totals[generated_key]["positive"] += positive
+            totals[generated_key]["total"] += total
 
-    for video_key, total in totals.items():
-        info["features"][video_key] = video_feature(width=width, height=height, fps=fps)
-        stats[video_key] = mask_stats(total["positive"], total["total"])
+    for source_key, generated_keys in generated_by_source.items():
+        width, height = dimensions[source_key]
+        for generated_key in generated_keys:
+            info["features"][generated_key] = video_feature(width, height, fps)
+            stats[generated_key] = mask_stats(
+                totals[generated_key]["positive"],
+                totals[generated_key]["total"],
+            )
 
-    update_episode_video_metadata(output_root, args.rgb_key, list(totals))
+    update_episode_video_metadata(output_root, generated_by_source)
     write_json(info_path, info)
     write_json(stats_path, stats)
+    manifest = {
+        "source_root": str(source_root),
+        "seg_root": str(seg_root),
+        "labels_source": str(labels_path),
+        "labels": labels,
+        "records": len(records),
+        "missing_records": [
+            {"video_key": key, "chunk_index": chunk, "file_index": file_index}
+            for key, chunk, file_index in missing
+        ],
+        "generated_features": generated_by_source,
+    }
+    write_json(output_root / "segmentation_manifest.json", manifest)
     print(f"Done: {output_root}")
-    print("Mask keys:")
-    for label in labels:
-        print(f"  {label}: {label_to_key[label]}")
+    for source_key, generated_keys in generated_by_source.items():
+        print(f"{source_key}:")
+        for generated_key in generated_keys:
+            print(f"  {generated_key}")
 
 
 if __name__ == "__main__":
