@@ -11,6 +11,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from label_metadata import read_label_names
+
 
 DEFAULT_COLORS = {
     1: (64, 160, 255),
@@ -55,10 +57,7 @@ def require_modules() -> None:
 
 
 def read_labels(path: Path) -> list[str]:
-    labels = [line.strip() for line in path.read_text().splitlines() if line.strip()]
-    if not labels:
-        raise RuntimeError(f"No labels found in {path}")
-    return labels
+    return read_label_names(path)
 
 
 def resolve_device(device: str) -> str:

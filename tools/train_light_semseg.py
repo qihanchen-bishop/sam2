@@ -27,6 +27,18 @@ LABELS = ["occluder", "object", "region", "tool"]
 IMAGE_KEYS = ["observation.images.front", "observation.images.side"]
 MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+PREVIEW_PALETTE = np.array(
+    [
+        [0, 0, 0],        # background
+        [64, 160, 255],   # occluder
+        [255, 105, 97],   # object
+        [119, 221, 119],  # region
+        [255, 209, 102],  # tool
+        [234, 146, 199],  # leftarm
+        [173, 214, 101],  # rightarm
+    ],
+    dtype=np.uint8,
+)
 
 
 @dataclass(frozen=True)
@@ -132,12 +144,14 @@ class VideoSemSegDataset(TorchDataset):
         image_size: tuple[int, int],
         mask_threshold: int,
         augment: bool,
+        horizontal_flip_prob: float,
         video_cache_size: int,
     ) -> None:
         self.samples = samples
         self.image_size = image_size
         self.mask_threshold = mask_threshold
         self.augment = augment
+        self.horizontal_flip_prob = horizontal_flip_prob
         self.video_cache_size = video_cache_size
         self._caps: OrderedDict[str, Any] = OrderedDict()
 
@@ -182,7 +196,7 @@ class VideoSemSegDataset(TorchDataset):
         mask = cv2.resize(mask, (out_w, out_h), interpolation=cv2.INTER_NEAREST)
 
         if self.augment:
-            if random.random() < 0.5:
+            if random.random() < self.horizontal_flip_prob:
                 image = np.ascontiguousarray(image[:, ::-1])
                 mask = np.ascontiguousarray(mask[:, ::-1])
             if random.random() < 0.8:
@@ -204,10 +218,12 @@ class ImageSemSegDataset(TorchDataset):
         samples: list[ImageSample],
         image_size: tuple[int, int],
         augment: bool,
+        horizontal_flip_prob: float,
     ) -> None:
         self.samples = samples
         self.image_size = image_size
         self.augment = augment
+        self.horizontal_flip_prob = horizontal_flip_prob
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -227,7 +243,7 @@ class ImageSemSegDataset(TorchDataset):
         mask = cv2.resize(mask, (out_w, out_h), interpolation=cv2.INTER_NEAREST)
 
         if self.augment:
-            if random.random() < 0.5:
+            if random.random() < self.horizontal_flip_prob:
                 image = np.ascontiguousarray(image[:, ::-1])
                 mask = np.ascontiguousarray(mask[:, ::-1])
             if random.random() < 0.8:
@@ -340,6 +356,24 @@ def to_image_samples(cache_root: Path, split: str, samples: list[Sample]) -> lis
             )
         )
     return image_samples
+
+
+def prebuilt_image_samples(cache_root: Path, split: str) -> list[ImageSample]:
+    """Read an episode-split cache prepared from accepted semantic masks."""
+    image_root = cache_root / "images" / split
+    mask_root = cache_root / "masks" / split
+    result = []
+    for image_path in sorted(image_root.glob("*/file-*/*.jpg")):
+        relative = image_path.relative_to(image_root)
+        mask_path = (mask_root / relative).with_suffix(".png")
+        if not mask_path.is_file():
+            raise FileNotFoundError(f"Missing paired mask: {mask_path}")
+        result.append(ImageSample(
+            image_path=str(image_path), mask_path=str(mask_path), split=split,
+            video_key=relative.parts[0], chunk_index=0,
+            file_index=int(relative.parts[1].removeprefix("file-")),
+            frame_index=int(image_path.stem)))
+    return result
 
 
 def read_next_frame(cap: Any, path: str, frame_index: int) -> np.ndarray:
@@ -467,6 +501,22 @@ def class_weights(samples: list[Sample | ImageSample], num_classes: int, max_sca
     return torch.tensor(weights, dtype=torch.float32)
 
 
+def foreground_dice_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """Mean soft Dice loss over foreground classes.
+
+    CE handles mutually-exclusive pixel identity while this term prevents the
+    small object/tool classes from being overwhelmed by background pixels.
+    """
+    probabilities = logits.softmax(dim=1)
+    one_hot = torch.nn.functional.one_hot(
+        targets, num_classes=logits.shape[1]
+    ).permute(0, 3, 1, 2).to(probabilities.dtype)
+    intersection = (probabilities[:, 1:] * one_hot[:, 1:]).sum(dim=(0, 2, 3))
+    denominator = (probabilities[:, 1:] + one_hot[:, 1:]).sum(dim=(0, 2, 3))
+    dice = (2.0 * intersection + 1.0) / (denominator + 1.0)
+    return 1.0 - dice.mean()
+
+
 @torch.no_grad()
 def evaluate(model: nn.Module, loader: Any, device: torch.device, num_classes: int) -> dict[str, float]:
     model.eval()
@@ -496,32 +546,56 @@ def evaluate(model: nn.Module, loader: Any, device: torch.device, num_classes: i
 
 
 def overlay_prediction(image_tensor: torch.Tensor, pred: np.ndarray, palette: np.ndarray) -> np.ndarray:
-    image = image_tensor.cpu().numpy().transpose(1, 2, 0)
-    image = np.clip((image * STD + MEAN) * 255.0, 0, 255).astype(np.uint8)
+    image = tensor_to_rgb(image_tensor)
     color = palette[pred]
     return (image * 0.55 + color * 0.45).astype(np.uint8)
 
 
+def tensor_to_rgb(image_tensor: torch.Tensor) -> np.ndarray:
+    image = image_tensor.cpu().numpy().transpose(1, 2, 0)
+    return np.clip((image * STD + MEAN) * 255.0, 0, 255).astype(np.uint8)
+
+
 @torch.no_grad()
-def save_previews(model: nn.Module, dataset: VideoSemSegDataset, device: torch.device, out_dir: Path, count: int) -> None:
+def save_previews(model: nn.Module, dataset: Any, device: torch.device, out_dir: Path, count: int) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    palette = np.array(
-        [
-            [0, 0, 0],
-            [50, 160, 255],
-            [255, 80, 80],
-            [60, 220, 120],
-            [210, 210, 80],
-        ],
-        dtype=np.uint8,
-    )
     model.eval()
-    for i in range(min(count, len(dataset))):
-        image, _ = dataset[i]
+    preview_count = min(count, len(dataset))
+    indices = np.linspace(0, len(dataset) - 1, preview_count, dtype=int)
+    for preview_index, dataset_index in enumerate(indices):
+        image, target = dataset[int(dataset_index)]
         logits = model(image.unsqueeze(0).to(device))
         pred = logits.argmax(dim=1)[0].cpu().numpy().astype(np.uint8)
-        overlay = overlay_prediction(image, pred, palette)
-        cv2.imwrite(str(out_dir / f"preview_{i:03d}.png"), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+        target_np = target.cpu().numpy().astype(np.uint8)
+        original = tensor_to_rgb(image)
+        gt_overlay = overlay_prediction(image, target_np, PREVIEW_PALETTE)
+        pred_overlay = overlay_prediction(image, pred, PREVIEW_PALETTE)
+        sheet = np.concatenate([original, gt_overlay, pred_overlay], axis=1)
+        for column, title in enumerate(("RGB", "GT", "PRED")):
+            cv2.putText(
+                sheet,
+                title,
+                (column * pred.shape[1] + 8, 24),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                3,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                sheet,
+                title,
+                (column * pred.shape[1] + 8, 24),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 0, 0),
+                1,
+                cv2.LINE_AA,
+            )
+        cv2.imwrite(
+            str(out_dir / f"preview_{preview_index:03d}_sample_{dataset_index:05d}.png"),
+            cv2.cvtColor(sheet, cv2.COLOR_RGB2BGR),
+        )
 
 
 def save_checkpoint(
@@ -556,7 +630,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-root", type=Path, default=Path("/home/qihan/data/sam2/segdata/final/newdata_3object"))
     parser.add_argument("--work-dir", type=Path, default=None)
-    parser.add_argument("--source", choices=["image-cache", "video"], default="image-cache")
+    parser.add_argument("--source", choices=["image-cache", "prebuilt-cache", "video"], default="image-cache")
     parser.add_argument("--image-cache-root", type=Path, default=None)
     parser.add_argument("--overwrite-cache", action="store_true")
     parser.add_argument("--prepare-cache-only", action="store_true")
@@ -575,6 +649,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--mask-threshold", type=int, default=8)
     parser.add_argument("--class-weight-scan", type=int, default=256)
+    parser.add_argument(
+        "--horizontal-flip-prob",
+        type=float,
+        default=0.5,
+        help="Training-only horizontal flip probability; use 0 for physical left/right labels.",
+    )
+    parser.add_argument(
+        "--dice-weight",
+        type=float,
+        default=0.0,
+        help="Weight of foreground soft-Dice loss added to weighted cross entropy.",
+    )
     parser.add_argument("--preview-count", type=int, default=8)
     parser.add_argument("--log-interval", type=int, default=50)
     parser.add_argument("--video-cache-size", type=int, default=32)
@@ -590,6 +676,10 @@ def main() -> None:
     args = parse_args()
     args.work_dir = args.work_dir or default_work_dir(args.dataset_root)
     args.work_dir.mkdir(parents=True, exist_ok=True)
+    if not 0.0 <= args.horizontal_flip_prob <= 1.0:
+        raise SystemExit("--horizontal-flip-prob must be in [0, 1]")
+    if args.dice_weight < 0.0:
+        raise SystemExit("--dice-weight must be non-negative")
 
     print(f"dataset_root={args.dataset_root}", flush=True)
     print(f"work_dir={args.work_dir}", flush=True)
@@ -603,7 +693,18 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    if args.source == "image-cache":
+    if args.source == "prebuilt-cache":
+        if args.image_cache_root is None:
+            raise SystemExit("--source prebuilt-cache requires --image-cache-root")
+        image_cache_root = args.image_cache_root
+        cache_manifest = json.loads((image_cache_root / "manifest.json").read_text())
+        if cache_manifest["labels"] != ["background", *args.labels]:
+            raise ValueError("Prebuilt cache labels differ from requested model labels")
+        train_samples = prebuilt_image_samples(image_cache_root, "train")
+        val_samples = prebuilt_image_samples(image_cache_root, "val")
+        samples = train_samples + val_samples
+        source_kind = "image-cache"
+    elif args.source == "image-cache":
         image_cache_root = args.image_cache_root or default_image_cache_root(args.dataset_root)
         print("building video sample index for image cache...", flush=True)
         video_samples = build_samples(
@@ -669,14 +770,25 @@ def main() -> None:
 
     num_classes = len(args.labels) + 1
     if source_kind == "image-cache":
-        train_dataset = ImageSemSegDataset(train_samples, args.image_size, augment=True)
-        val_dataset = ImageSemSegDataset(val_samples, args.image_size, augment=False)
+        train_dataset = ImageSemSegDataset(
+            train_samples,
+            args.image_size,
+            augment=True,
+            horizontal_flip_prob=args.horizontal_flip_prob,
+        )
+        val_dataset = ImageSemSegDataset(
+            val_samples,
+            args.image_size,
+            augment=False,
+            horizontal_flip_prob=0.0,
+        )
     else:
         train_dataset = VideoSemSegDataset(
             train_samples,
             args.image_size,
             args.mask_threshold,
             augment=True,
+            horizontal_flip_prob=args.horizontal_flip_prob,
             video_cache_size=args.video_cache_size,
         )
         val_dataset = VideoSemSegDataset(
@@ -684,6 +796,7 @@ def main() -> None:
             args.image_size,
             args.mask_threshold,
             augment=False,
+            horizontal_flip_prob=0.0,
             video_cache_size=args.video_cache_size,
         )
     train_loader = DataLoader(
@@ -730,6 +843,8 @@ def main() -> None:
             with torch.autocast(device_type=device.type, enabled=(device.type == "cuda" and not args.no_amp)):
                 logits = model(images)
                 loss = criterion(logits, targets)
+                if args.dice_weight:
+                    loss = loss + args.dice_weight * foreground_dice_loss(logits, targets)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -750,13 +865,16 @@ def main() -> None:
         metrics["seconds"] = time.time() - start
         save_checkpoint(args.work_dir / "latest.pt", model, optimizer, epoch, metrics, args)
 
-        improved = metrics["miou"] > best_miou + args.min_delta
+        previous_best_miou = best_miou
+        improved = metrics["miou"] > previous_best_miou
+        meaningful_improvement = metrics["miou"] > previous_best_miou + args.min_delta
         if improved:
             best_miou = metrics["miou"]
             best_epoch = epoch
-            stale_epochs = 0
             save_checkpoint(args.work_dir / "best.pt", model, optimizer, epoch, metrics, args)
             save_previews(model, val_dataset, device, args.work_dir / "previews", args.preview_count)
+        if meaningful_improvement:
+            stale_epochs = 0
         else:
             stale_epochs += 1
 
@@ -784,8 +902,28 @@ def main() -> None:
             )
             break
 
-    print(f"best_mIoU={best_miou:.4f} best_epoch={best_epoch}", flush=True)
-    print(f"best_checkpoint={args.work_dir / 'best.pt'}", flush=True)
+    best_checkpoint_path = args.work_dir / "best.pt"
+    checkpoint = torch.load(best_checkpoint_path, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint["model"])
+    best_metrics = evaluate(model, val_loader, device, num_classes)
+    evaluation = {
+        "best_checkpoint": str(best_checkpoint_path.resolve()),
+        "best_epoch": int(checkpoint["epoch"]),
+        "labels": ["background", *args.labels],
+        "validation_samples": len(val_samples),
+        "loss": best_metrics["loss"],
+        "miou": best_metrics["miou"],
+        "pixel_acc": best_metrics["pixel_acc"],
+        "per_class_iou": {
+            label: best_metrics[f"iou_{index}"]
+            for index, label in enumerate(["background", *args.labels])
+        },
+    }
+    write_json(args.work_dir / "evaluation.json", evaluation)
+    save_previews(model, val_dataset, device, args.work_dir / "previews", args.preview_count)
+    print(f"best_mIoU={best_metrics['miou']:.4f} best_epoch={checkpoint['epoch']}", flush=True)
+    print(f"best_checkpoint={best_checkpoint_path}", flush=True)
+    print(f"evaluation={args.work_dir / 'evaluation.json'}", flush=True)
 
 
 if __name__ == "__main__":

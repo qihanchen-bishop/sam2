@@ -93,7 +93,10 @@ def _load_img_as_tensor(img_path, image_size):
     img_pil = Image.open(img_path)
     img_np = np.array(img_pil.convert("RGB").resize((image_size, image_size)))
     if img_np.dtype == np.uint8:  # np.uint8 is expected for JPEG images
-        img_np = img_np / 255.0
+        # The video loader caches every decoded frame. Keep that cache in
+        # float32 instead of NumPy's float64 division result; the predictor
+        # converts images to float32 before running the image encoder anyway.
+        img_np = img_np.astype(np.float32) / 255.0
     else:
         raise RuntimeError(f"Unknown image dtype: {img_np.dtype} on {img_path}")
     img = torch.from_numpy(img_np).permute(2, 0, 1)

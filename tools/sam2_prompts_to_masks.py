@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import types
 from contextlib import nullcontext
 from pathlib import Path
@@ -24,7 +25,51 @@ DEFAULT_COLORS = [
     (177, 156, 217),
     (64, 210, 210),
 ]
-CLASS_PRIORITY = ["occluder", "region", "leftarm", "rightarm", "object", "tool"]
+CANONICAL_CLASS_COLORS = {
+    "occluder": (64, 160, 255),
+    "tube": (255, 92, 138),
+    "object": (255, 105, 97),
+    "region": (119, 221, 119),
+    "tool": (255, 209, 102),
+    "lefttool": (255, 209, 102),
+    "righttool": (101, 214, 173),
+    "leftarm": (234, 146, 199),
+    "rightarm": (173, 214, 101),
+}
+# Later classes win overlapping pixels. Keep manipulated objects above tools,
+# tools above the target region, and the region above the occluder.
+CLASS_PRIORITY = [
+    "occluder", "tube", "region", "leftarm", "rightarm",
+    "tool", "lefttool", "righttool", "object",
+]
+
+PRIORITY_RULE = "righttool_secondary_below_lefttool_v1"
+
+
+def compose_priority_masks(objects, masks, shape):
+    """Resolve overlaps using components of each independent, uncomposited mask."""
+    import cv2
+    import numpy as np
+
+    layers = []
+    for obj in objects:
+        obj_id, name = int(obj['id']), str(obj['name'])
+        if obj_id not in masks:
+            continue
+        binary = np.asarray(masks[obj_id], dtype=bool)
+        rank = CLASS_PRIORITY.index(name) if name in CLASS_PRIORITY else len(CLASS_PRIORITY)
+        if name == 'righttool':
+            count, labels, stats, _ = cv2.connectedComponentsWithStats(binary.astype(np.uint8), connectivity=8)
+            if count > 1:
+                main = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+                layers.append((CLASS_PRIORITY.index('lefttool') - .5, obj_id, binary & (labels != main)))
+                layers.append((rank, obj_id, labels == main))
+        else:
+            layers.append((rank, obj_id, binary))
+    result = np.zeros(shape, dtype=np.uint8)
+    for _, obj_id, binary in sorted(layers, key=lambda layer: (layer[0], layer[1])):
+        result[binary] = obj_id
+    return result
 
 
 def parse_args() -> argparse.Namespace:
@@ -50,7 +95,25 @@ def parse_args() -> argparse.Namespace:
         help="Hydra config name relative to sam2/configs.",
     )
     parser.add_argument("--device", default="auto", help="auto, cuda, cuda:0, or cpu.")
+    parser.add_argument(
+        "--compile-mode", choices=("none", "encoder", "full"), default="none",
+        help="Optional torch.compile mode; first run may take several minutes.",
+    )
     parser.add_argument("--mask-threshold", type=float, default=0.0)
+    parser.add_argument(
+        "--propagate-prompt-frames", action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Predict prompt-frame outputs using temporal memory, preserve conditioning memory, and refine frame zero from frame one.",
+    )
+    parser.add_argument(
+        "--composition-mode",
+        choices=("priority", "max-logit"),
+        default="priority",
+        help=(
+            "Resolve overlapping class masks by a fixed class priority or by "
+            "the highest positive SAM2 logit at each pixel."
+        ),
+    )
     parser.add_argument(
         "--offload-video-to-cpu",
         action=argparse.BooleanOptionalAction,
@@ -62,12 +125,31 @@ def parse_args() -> argparse.Namespace:
         default=False,
     )
     parser.add_argument("--keep-frames", action="store_true")
+    parser.add_argument(
+        "--save-bidirectional",
+        action="store_true",
+        default=True,
+        help=(
+            "Save independent forward and reverse masks for quality evaluation. "
+            "This runs an additional reverse propagation pass."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--limit", type=int, default=0, help="Process at most N files; 0 means all.")
+    parser.add_argument("--num-shards", type=int, default=1)
+    parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument(
         "--validate-only",
         action="store_true",
         help="Validate prompt JSON and source paths without loading SAM2.",
+    )
+    parser.add_argument(
+        "--refresh-visuals-only",
+        action="store_true",
+        help=(
+            "Re-encode mask_visual.mp4 from existing mutually-exclusive "
+            "mask_frames without loading SAM2 or changing mask IDs."
+        ),
     )
     return parser.parse_args()
 
@@ -138,6 +220,12 @@ def discover_prompt_files(args: argparse.Namespace) -> tuple[list[Path], Path | 
     paths = sorted(root.rglob("sam2_prompts.json"))
     if not paths:
         raise RuntimeError(f"No sam2_prompts.json files found under {root}")
+    if args.num_shards < 1 or not 0 <= args.shard_index < args.num_shards:
+        raise RuntimeError("shard-index must be in [0, num-shards)")
+    paths = [
+        path for index, path in enumerate(paths)
+        if index % args.num_shards == args.shard_index
+    ]
     if args.limit > 0:
         paths = paths[: args.limit]
     return paths, root
@@ -281,6 +369,7 @@ def save_propagated_masks(
     reverse: bool,
     threshold: float,
     total_frames: int,
+    max_frame_num_to_track: int | None = None,
 ) -> None:
     import numpy as np
     from PIL import Image
@@ -289,6 +378,7 @@ def save_propagated_masks(
     for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
         inference_state,
         start_frame_idx=start_frame_idx,
+        max_frame_num_to_track=max_frame_num_to_track,
         reverse=reverse,
     ):
         for index, obj_id in enumerate(out_obj_ids):
@@ -300,11 +390,114 @@ def save_propagated_masks(
             print(f"  {direction}: frame {out_frame_idx + 1}/{total_frames}", flush=True)
 
 
+def object_is_visible(raw_obj: dict[str, Any], frame_idx: int) -> bool:
+    ranges = raw_obj.get("visible_ranges")
+    return not ranges or any(int(start) <= frame_idx <= int(end) for start, end in ranges)
+
+
+def save_propagated_class_masks(
+    predictor: Any,
+    inference_state: dict[str, Any],
+    destinations: list[tuple[Path, int | None, int | None]],
+    objects: list[dict[str, Any]],
+    start_frame_idx: int,
+    reverse: bool,
+    threshold: float,
+    total_frames: int,
+    max_frame_num_to_track: int | None = None,
+    composition_mode: str = "priority",
+    propagate_prompt_frames: bool = False,
+) -> None:
+    import numpy as np
+    from PIL import Image
+
+    for directory, _, _ in destinations:
+        directory.mkdir(parents=True, exist_ok=True)
+
+    def priority(raw_obj: dict[str, Any]) -> tuple[int, int]:
+        name = str(raw_obj["name"])
+        rank = CLASS_PRIORITY.index(name) if name in CLASS_PRIORITY else len(CLASS_PRIORITY)
+        return rank, int(raw_obj["id"])
+
+    ordered_objects = sorted(objects, key=priority)
+    direction = "reverse" if reverse else "forward"
+    for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
+        inference_state,
+        start_frame_idx=start_frame_idx,
+        max_frame_num_to_track=max_frame_num_to_track,
+        reverse=reverse,
+        propagate_conditioning_outputs=propagate_prompt_frames,
+    ):
+        logits_by_id = {
+            int(obj_id): np.squeeze(out_mask_logits[index].float().cpu().numpy())
+            for index, obj_id in enumerate(out_obj_ids)
+        }
+        first_logits = next(iter(logits_by_id.values()))
+        class_mask = np.zeros(first_logits.shape, dtype=np.uint8)
+        if composition_mode == "max-logit":
+            best_logits = np.full(first_logits.shape, threshold, dtype=np.float32)
+            for raw_obj in ordered_objects:
+                obj_id = int(raw_obj["id"])
+                if obj_id not in logits_by_id or not object_is_visible(raw_obj, out_frame_idx):
+                    continue
+                logits = logits_by_id[obj_id]
+                wins = logits > best_logits
+                class_mask[wins] = obj_id
+                best_logits[wins] = logits[wins]
+        else:
+            masks = {int(obj['id']): logits_by_id[int(obj['id'])] > threshold
+                     for obj in objects if int(obj['id']) in logits_by_id
+                     and object_is_visible(obj, out_frame_idx)}
+            class_mask = compose_priority_masks(objects, masks, first_logits.shape)
+        image = Image.fromarray(class_mask, mode="L")
+        for directory, save_start, save_end in destinations:
+            if (save_start is None or out_frame_idx >= save_start) and (
+                save_end is None or out_frame_idx <= save_end
+            ):
+                image.save(directory / f"{out_frame_idx:05d}.png")
+        if out_frame_idx % 50 == 0 or out_frame_idx in (0, total_frames - 1):
+            print(f"  {direction}: frame {out_frame_idx + 1}/{total_frames}", flush=True)
+
+
+def add_prompts_to_state(
+    predictor: Any,
+    inference_state: dict[str, Any],
+    objects: list[dict[str, Any]],
+    width: int,
+    height: int,
+) -> list[int]:
+    import numpy as np
+
+    prompt_frames: list[int] = []
+    for raw_obj in objects:
+        obj_id = int(raw_obj["id"])
+        for frame_idx, frame_input in sorted(prompt_inputs_for_object(raw_obj).items()):
+            box = frame_input.get("box")
+            if box is not None:
+                box[0::2] = np.clip(box[0::2], 0, width - 1)
+                box[1::2] = np.clip(box[1::2], 0, height - 1)
+            points = frame_input.get("points")
+            if points is not None:
+                points[:, 0] = np.clip(points[:, 0], 0, width - 1)
+                points[:, 1] = np.clip(points[:, 1], 0, height - 1)
+            predictor.add_new_points_or_box(
+                inference_state=inference_state,
+                frame_idx=frame_idx,
+                obj_id=obj_id,
+                points=points,
+                labels=frame_input.get("labels"),
+                box=box,
+            )
+            prompt_frames.append(frame_idx)
+    return prompt_frames
+
+
 def apply_visibility_ranges(
     object_mask_dir: Path,
     objects: list[dict[str, Any]],
     total_frames: int,
     frame_size: tuple[int, int],
+    existing_only: bool = False,
 ) -> None:
     from PIL import Image
 
@@ -321,12 +514,17 @@ def apply_visibility_ranges(
         }
         for frame_idx in range(total_frames):
             if frame_idx not in visible:
-                empty_mask.save(
-                    object_mask_dir / f"{frame_idx:05d}_obj{obj_id:03d}.png"
-                )
+                mask_path = object_mask_dir / f"{frame_idx:05d}_obj{obj_id:03d}.png"
+                if not existing_only or mask_path.exists():
+                    empty_mask.save(mask_path)
 
 
-def parse_color(value: Any, obj_id: int) -> tuple[int, int, int]:
+def parse_color(
+    value: Any, obj_id: int, class_name: str | None = None
+) -> tuple[int, int, int]:
+    canonical = CANONICAL_CLASS_COLORS.get(str(class_name or "").strip().lower())
+    if canonical is not None:
+        return canonical
     if isinstance(value, str):
         text = value.strip().lstrip("#")
         if len(text) == 6:
@@ -362,17 +560,54 @@ def export_visual_outputs(
         width, height = frame.size
         class_mask = np.zeros((height, width), dtype=np.uint8)
         visual_mask = np.zeros((height, width, 3), dtype=np.uint8)
+        masks = {}
         for raw_obj in ordered_objects:
             obj_id = int(raw_obj["id"])
             mask_path = object_mask_dir / f"{frame_idx:05d}_obj{obj_id:03d}.png"
             if not mask_path.exists():
                 continue
             binary = np.asarray(Image.open(mask_path).convert("L")) > 0
-            color = np.asarray(parse_color(raw_obj.get("color"), obj_id), dtype=np.uint8)
-            class_mask[binary] = obj_id
-            visual_mask[binary] = color
+            masks[obj_id] = binary
+        class_mask = compose_priority_masks(objects, masks, (height, width))
+        for raw_obj in ordered_objects:
+            obj_id = int(raw_obj['id'])
+            color = np.asarray(
+                parse_color(raw_obj.get("color"), obj_id, raw_obj.get("name")),
+                dtype=np.uint8,
+            )
+            visual_mask[class_mask == obj_id] = color
         Image.fromarray(class_mask, mode="L").save(mask_dir / f"{frame_idx:05d}.png")
         Image.fromarray(visual_mask, mode="RGB").save(visual_dir / f"{frame_idx:05d}.png")
+
+
+def export_class_mask_range(
+    object_mask_dir: Path,
+    output_dir: Path,
+    objects: list[dict[str, Any]],
+    frame_indices: range,
+    frame_size: tuple[int, int],
+) -> None:
+    import numpy as np
+    from PIL import Image
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    width, height = frame_size
+
+    def priority(raw_obj: dict[str, Any]) -> tuple[int, int]:
+        name = str(raw_obj["name"])
+        rank = CLASS_PRIORITY.index(name) if name in CLASS_PRIORITY else len(CLASS_PRIORITY)
+        return rank, int(raw_obj["id"])
+
+    ordered_objects = sorted(objects, key=priority)
+    for frame_idx in frame_indices:
+        masks = {}
+        for raw_obj in ordered_objects:
+            obj_id = int(raw_obj["id"])
+            path = object_mask_dir / f"{frame_idx:05d}_obj{obj_id:03d}.png"
+            if path.is_file():
+                masks[obj_id] = np.asarray(Image.open(path).convert("L")) > 0
+        class_mask = compose_priority_masks(objects, masks, (height, width))
+        Image.fromarray(class_mask, mode="L").save(output_dir / f"{frame_idx:05d}.png")
 
 
 def probe_fps(video_path: Path) -> float:
@@ -422,6 +657,64 @@ def encode_mask_visual_video(output_dir: Path, video_path: Path) -> None:
     subprocess.run(command, check=True)
 
 
+def encode_class_mask_visual_video(
+    mask_dir: Path,
+    output_path: Path,
+    video_path: Path,
+    objects: list[dict[str, Any]],
+) -> None:
+    import numpy as np
+    from PIL import Image
+
+    mask_paths = sorted(mask_dir.glob("*.png"), key=lambda path: int(path.stem))
+    if not mask_paths:
+        raise RuntimeError(f"No class masks found under {mask_dir}")
+    with Image.open(mask_paths[0]) as first_mask:
+        width, height = first_mask.size
+    color_lut = np.zeros((256, 3), dtype=np.uint8)
+    for raw_obj in objects:
+        obj_id = int(raw_obj["id"])
+        color_lut[obj_id] = parse_color(
+            raw_obj.get("color"), obj_id, raw_obj.get("name")
+        )
+
+    command = [
+        find_executable("ffmpeg"),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{width}x{height}",
+        "-r",
+        f"{probe_fps(video_path):.6f}",
+        "-i",
+        "-",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-threads",
+        "2",
+        "-pix_fmt",
+        "yuv420p",
+        str(output_path),
+    ]
+    process = subprocess.Popen(command, stdin=subprocess.PIPE)
+    assert process.stdin is not None
+    try:
+        for mask_path in mask_paths:
+            class_mask = np.asarray(Image.open(mask_path).convert("L"), dtype=np.uint8)
+            process.stdin.write(color_lut[class_mask].tobytes())
+    finally:
+        process.stdin.close()
+    if process.wait() != 0:
+        raise RuntimeError(f"ffmpeg failed to encode {output_path}")
+
+
 def run_one(
     predictor: Any,
     data: dict[str, Any],
@@ -429,7 +722,6 @@ def run_one(
     args: argparse.Namespace,
     device: str,
 ) -> None:
-    import numpy as np
     import torch
     from PIL import Image
 
@@ -447,8 +739,9 @@ def run_one(
             )
         shutil.rmtree(destination)
     partial.mkdir(parents=True)
-    object_mask_dir = partial / "object_mask_frames"
-    object_mask_dir.mkdir()
+    mask_dir = partial / "mask_frames"
+    mask_dir.mkdir()
+    started_at = time.monotonic()
 
     temp_context = None
     if args.keep_frames:
@@ -458,12 +751,14 @@ def run_one(
         frame_dir = Path(temp_context.name)
 
     inference_state = None
+    reverse_inference_state = None
     try:
         frames = extract_frames(data["_video_path"], frame_dir)
         if len(frames) != int(data["frame_count"]):
             raise RuntimeError(
                 f"Frame count mismatch: JSON={data['frame_count']}, decoded={len(frames)}"
             )
+        extracted_at = time.monotonic()
         width, height = Image.open(frames[0]).size
         inference_state = predictor.init_state(
             video_path=str(frame_dir),
@@ -479,58 +774,149 @@ def run_one(
             else nullcontext()
         )
         with torch.inference_mode(), autocast_context:
-            for raw_obj in data["objects"]:
-                obj_id = int(raw_obj["id"])
-                for frame_idx, frame_input in sorted(
-                    prompt_inputs_for_object(raw_obj).items()
-                ):
-                    box = frame_input.get("box")
-                    if box is not None:
-                        box[0::2] = np.clip(box[0::2], 0, width - 1)
-                        box[1::2] = np.clip(box[1::2], 0, height - 1)
-                    points = frame_input.get("points")
-                    if points is not None:
-                        points[:, 0] = np.clip(points[:, 0], 0, width - 1)
-                        points[:, 1] = np.clip(points[:, 1], 0, height - 1)
-                    predictor.add_new_points_or_box(
-                        inference_state=inference_state,
-                        frame_idx=frame_idx,
-                        obj_id=obj_id,
-                        points=points,
-                        labels=frame_input.get("labels"),
-                        box=box,
+            prompt_frames = add_prompts_to_state(
+                predictor, inference_state, data["objects"], width, height
+            )
+            initialized_at = time.monotonic()
+            first_prompt_frame = min(prompt_frames)
+            last_prompt_frame = max(prompt_frames)
+            forward_destinations = [(mask_dir, None, None)]
+            if args.save_bidirectional:
+                forward_destinations.append(
+                    (
+                        partial / "directional_mask_frames" / "forward",
+                        None,
+                        None,
                     )
-                    prompt_frames.append(frame_idx)
+                )
 
-            save_propagated_masks(
+            save_propagated_class_masks(
                 predictor,
                 inference_state,
-                object_mask_dir,
-                min(prompt_frames),
+                forward_destinations,
+                data["objects"],
+                first_prompt_frame,
                 False,
                 args.mask_threshold,
                 len(frames),
+                composition_mode=args.composition_mode,
+                propagate_prompt_frames=args.propagate_prompt_frames,
             )
-            first_prompt_frame = min(prompt_frames)
             if first_prompt_frame > 0:
-                save_propagated_masks(
+                save_propagated_class_masks(
                     predictor,
                     inference_state,
-                    object_mask_dir,
+                    forward_destinations,
+                    data["objects"],
                     first_prompt_frame,
                     True,
                     args.mask_threshold,
                     len(frames),
+                    composition_mode=args.composition_mode,
+                    propagate_prompt_frames=args.propagate_prompt_frames,
                 )
 
-        apply_visibility_ranges(
-            object_mask_dir,
+            if args.save_bidirectional:
+                predictor.reset_state(inference_state)
+                inference_state = None
+                reverse_inference_state = predictor.init_state(
+                    video_path=str(frame_dir),
+                    offload_video_to_cpu=args.offload_video_to_cpu,
+                    offload_state_to_cpu=args.offload_state_to_cpu,
+                    async_loading_frames=True,
+                )
+                reverse_prompt_frames = add_prompts_to_state(
+                    predictor,
+                    reverse_inference_state,
+                    data["objects"],
+                    width,
+                    height,
+                )
+                save_propagated_class_masks(
+                    predictor,
+                    reverse_inference_state,
+                    [
+                        (
+                            partial / "directional_mask_frames" / "reverse",
+                            None,
+                            None,
+                        )
+                    ],
+                    data["objects"],
+                    max(reverse_prompt_frames),
+                    True,
+                    args.mask_threshold,
+                    len(frames),
+                    len(frames),
+                    composition_mode=args.composition_mode,
+                    propagate_prompt_frames=args.propagate_prompt_frames,
+                )
+                if last_prompt_frame < len(frames) - 1:
+                    save_propagated_class_masks(
+                        predictor, reverse_inference_state,
+                        [(partial / "directional_mask_frames" / "reverse", last_prompt_frame, None)],
+                        data["objects"], last_prompt_frame, False, args.mask_threshold, len(frames),
+                        composition_mode=args.composition_mode,
+                        propagate_prompt_frames=args.propagate_prompt_frames,
+                    )
+
+            if args.propagate_prompt_frames and len(frames) > 1:
+                # Fresh two-frame state, shared model: target zero receives no
+                # prompts. The completed frame-one output is the only seed.
+                with tempfile.TemporaryDirectory(prefix="sam2_first_frame_") as first_tmp:
+                    first_dir = Path(first_tmp)
+                    for i in (0, 1):
+                        (first_dir / f"{i:05d}.jpg").symlink_to(frames[i].resolve())
+                    first_state = predictor.init_state(
+                        video_path=str(first_dir), offload_video_to_cpu=True,
+                    )
+                    import numpy as np
+                    seed = np.asarray(Image.open(mask_dir / "00001.png"))
+                    for obj in data["objects"]:
+                        predictor.add_new_mask(first_state, 1, int(obj["id"]), seed == obj["id"])
+                    save_propagated_class_masks(
+                        predictor, first_state, [(mask_dir, 0, 0)], data["objects"],
+                        1, True, args.mask_threshold, 2, max_frame_num_to_track=1,
+                        composition_mode=args.composition_mode,
+                    )
+                    predictor.reset_state(first_state)
+                    del first_state
+                    if args.save_bidirectional:
+                        shutil.copy2(mask_dir / "00000.png", partial / "directional_mask_frames/forward/00000.png")
+                        reverse_dir = partial / "directional_mask_frames/reverse"
+                        first_state = predictor.init_state(video_path=str(first_dir), offload_video_to_cpu=True)
+                        seed = np.asarray(Image.open(reverse_dir / "00001.png"))
+                        for obj in data["objects"]:
+                            predictor.add_new_mask(first_state, 1, int(obj["id"]), seed == obj["id"])
+                        save_propagated_class_masks(
+                            predictor, first_state, [(reverse_dir, 0, 0)], data["objects"],
+                            1, True, args.mask_threshold, 2, max_frame_num_to_track=1,
+                            composition_mode=args.composition_mode,
+                        )
+                        predictor.reset_state(first_state)
+                        del first_state
+
+        propagated_at = time.monotonic()
+        if len(list(mask_dir.glob("*.png"))) != len(frames):
+            raise RuntimeError(f"SAM2 did not produce all {len(frames)} class masks")
+        encode_class_mask_visual_video(
+            mask_dir,
+            partial / "mask_visual.mp4",
+            data["_video_path"],
             data["objects"],
-            len(frames),
-            (width, height),
         )
-        export_visual_outputs(partial, frames, data["objects"])
-        encode_mask_visual_video(partial, data["_video_path"])
+        if args.save_bidirectional:
+            from sam2_direction_review import analyze
+            if len(frames) == 1:
+                shutil.copy2(mask_dir / "00000.png", partial / "directional_mask_frames/reverse/00000.png")
+            shutil.copy2(partial / "mask_visual.mp4", partial / "mask_visual_forward.mp4")
+            encode_class_mask_visual_video(
+                partial / "directional_mask_frames/reverse", partial / "mask_visual_reverse.mp4",
+                data["_video_path"], data["objects"],
+            )
+            report = analyze(partial, data["objects"], len(frames))
+            print(f"Bidirectional review: {report['conflict_frame_count']} conflict frames in {len(report['intervals'])} intervals", flush=True)
+        encoded_at = time.monotonic()
         clean_prompt = {key: value for key, value in data.items() if not key.startswith("_")}
         (partial / "sam2_prompts.json").write_text(
             json.dumps(clean_prompt, ensure_ascii=False, indent=2) + "\n",
@@ -541,23 +927,64 @@ def run_one(
             "frame_count": len(frames),
             "object_ids": [int(item["id"]) for item in data["objects"]],
             "mask_threshold": args.mask_threshold,
+            "composition_mode": args.composition_mode,
+            "priority_rule": PRIORITY_RULE if args.composition_mode == 'priority' else None,
+            "propagate_prompt_frames": args.propagate_prompt_frames,
+            "conditioning_memory_preserved": True,
+            "first_frame_reverse_refined": args.propagate_prompt_frames and len(frames) > 1,
             "sam2_config": args.sam2_config,
             "sam2_checkpoint": str(args.sam2_checkpoint.resolve()),
+            "device": device,
+            "compile_mode": args.compile_mode,
+            "offload_video_to_cpu": args.offload_video_to_cpu,
+            "offload_state_to_cpu": args.offload_state_to_cpu,
+            "timing_seconds": {
+                "extract": round(extracted_at - started_at, 3),
+                "initialize": round(initialized_at - extracted_at, 3),
+                "propagate": round(propagated_at - initialized_at, 3),
+                "encode": round(encoded_at - propagated_at, 3),
+                "total": round(encoded_at - started_at, 3),
+            },
+            "video_processing_fps": round(len(frames) / max(encoded_at - started_at, 1e-6), 3),
             "outputs": [
                 "mask_frames",
-                "mask_visual_frames",
                 "mask_visual.mp4",
-                "object_mask_frames",
             ],
         }
+        if args.save_bidirectional:
+            completion["bidirectional"] = {
+                "forward_start_frame": min(prompt_frames),
+                "reverse_end_frame": max(prompt_frames),
+                "overlap_start_frame": 0,
+                "overlap_end_frame": len(frames) - 1,
+                "output": "directional_mask_frames",
+                "review_status": "pending_human_selection",
+            }
+            completion["outputs"].append("directional_mask_frames")
+            completion["outputs"].extend(["mask_visual_forward.mp4", "mask_visual_reverse.mp4",
+                                          "direction_conflicts.json", "direction_review.json"])
+            completion["review_status"] = "pending_human_selection"
         (partial / "complete.json").write_text(
             json.dumps(completion, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+        if args.save_bidirectional:
+            from sam2_direction_review import filter_candidates
+            print('Automatic filtering: area >=20, secondary distance <= area; righttool/object keep two only on contact, otherwise one; whole-mask IoU/count conflicts...', flush=True)
+            filtered_review = filter_candidates(partial)
+            completion['candidate_filter'] = filtered_review['candidate_filter']
+            completion['outputs'].extend(['filtered_versions', 'conflict_reports'])
+            completion['timing_seconds']['encode'] = round(time.monotonic() - propagated_at, 3)
+            completion['timing_seconds']['total'] = round(time.monotonic() - started_at, 3)
+            completion['video_processing_fps'] = round(len(frames) / max(time.monotonic() - started_at, 1e-6), 3)
+            (partial / 'complete.json').write_text(json.dumps(completion, ensure_ascii=False, indent=2)+'\n', encoding='utf-8')
+            print(f"Filtered review: {filtered_review['conflict_frame_count']} conflict frames", flush=True)
         partial.rename(destination)
     finally:
         if inference_state is not None:
             predictor.reset_state(inference_state)
+        if reverse_inference_state is not None:
+            predictor.reset_state(reverse_inference_state)
         if temp_context is not None:
             temp_context.cleanup()
         if device.startswith("cuda"):
@@ -582,6 +1009,29 @@ def main() -> None:
     if args.validate_only:
         print(f"Validated {len(records)} prompt file(s).")
         return
+    if args.refresh_visuals_only:
+        failures: list[str] = []
+        for _, data, destination in records:
+            try:
+                mask_dir = destination / "mask_frames"
+                if not (destination / "complete.json").is_file() or not mask_dir.is_dir():
+                    raise RuntimeError(f"Incomplete SAM2 output: {destination}")
+                encode_class_mask_visual_video(
+                    mask_dir,
+                    destination / "mask_visual.mp4",
+                    data["_video_path"],
+                    data["objects"],
+                )
+                print(f"REFRESHED {destination / 'mask_visual.mp4'}", flush=True)
+            except Exception as exc:
+                failures.append(f"{destination}: {exc}")
+        if failures:
+            raise RuntimeError(
+                f"{len(failures)}/{len(records)} visual refreshes failed:\n"
+                + "\n".join(failures)
+            )
+        print(f"Refreshed {len(records)} mask visual(s).")
+        return
     if not args.sam2_checkpoint.is_file():
         raise RuntimeError(f"SAM2 checkpoint not found: {args.sam2_checkpoint}")
 
@@ -589,12 +1039,21 @@ def main() -> None:
     from sam2.build_sam import build_sam2_video_predictor
 
     device = resolve_device(args.device)
-    print(f"Loading SAM2 on {device}: {args.sam2_checkpoint}")
+    print(
+        f"Loading SAM2 on {device}: {args.sam2_checkpoint}; "
+        f"compile={args.compile_mode}; video_cpu={args.offload_video_to_cpu}; "
+        f"state_cpu={args.offload_state_to_cpu}",
+        flush=True,
+    )
+    overrides = ["++model.clear_non_cond_mem_around_input=true"]
+    if args.compile_mode == "encoder":
+        overrides.append("++model.compile_image_encoder=true")
     predictor = build_sam2_video_predictor(
         args.sam2_config,
         str(args.sam2_checkpoint.resolve()),
         device=device,
-        hydra_overrides_extra=["++model.clear_non_cond_mem_around_input=true"],
+        hydra_overrides_extra=overrides,
+        vos_optimized=args.compile_mode == "full",
     )
     add_clear_non_cond_memory_compat(predictor)
     disable_unavailable_hole_filling(predictor)

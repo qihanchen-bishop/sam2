@@ -224,6 +224,20 @@ python tools/yolo_sam2/convert_sam2_masks_to_lerobot.py \
 The final dataset adds `front_occluder`, `front_object`, `front_region`,
 `front_tool`, and the corresponding four side-view video features.
 
+## GitHub 同步与本地数据
+
+GitHub 保存源码、配置和文档；数据与运行结果保留在本地。将原始数据放在
+`segdata/origin/`，标注、预览、训练缓存及模型放在 `segdata/temp/`，导出数据放在
+`segdata/final/`。这些目录仅跟踪 `.gitkeep`，目录内的标签、提示、图像、视频、
+评分和权重均不参与普通 Git 同步。
+
+根目录的数据、输出、结果和缓存目录，模型权重文件，以及 `demo/data/`、
+`notebooks/images/`、`notebooks/videos/`、`sav_dataset/example/` 中的示例数据
+也由 [.gitignore](.gitignore) 排除。`checkpoints/download_ckpts.sh` 和
+`training/dataset/`、`demo/backend/server/data/` 中的代码仍正常同步。
+取消数据文件跟踪使用 `git rm --cached`，本地文件会保留；这些规则不清除已有提交
+中的历史数据。同步时正常使用 `git add`，不要对数据使用 `git add -f`。
+
 ## Key Files
 
 - `tools/yolo_sam2/convert_sam2_masks_to_yolo.py`: convert SAM2 masks to YOLO labels.
@@ -237,3 +251,23 @@ The final dataset adds `front_occluder`, `front_object`, `front_region`,
 
 If you use the SAM2 model or checkpoints, cite the original SAM2 work and follow the original license:
 <https://github.com/facebookresearch/sam2>
+
+# 相关 Skills
+
+  1. $sam2-prompt-annotator
+
+  从 labels.txt 理解类别，选择少量任务和视角的视频帧，生成并检查初始 SAM2 box prompt。
+
+  $sam2-prompt-annotator 帮我为 /path/origin/dataset 的每个任务和视角生成三帧初始 prompt
+
+  2. $sam2-yolo-seed-trainer
+
+  使用审核后的少量 prompt 完成种子视频分割，转换 YOLO 数据并训练 YOLO Detect prompt 模型。
+
+  $sam2-yolo-seed-trainer 使用 /path/origin/dataset 的初始 prompt 训练 YOLO prompt 模型
+
+  3. $sam2-yolo-full-dataset-builder
+
+  使用训练好的 YOLO 对全部视频生成 prompt，执行 SAM2 双向分割、质量评估，审核后导出 final LeRobot 数据集。
+
+  $sam2-yolo-full-dataset-builder 使用训练好的 YOLO 模型完成 /path/origin/dataset 的全量分割并生成 final 数据

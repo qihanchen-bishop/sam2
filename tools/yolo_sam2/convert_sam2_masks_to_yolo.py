@@ -15,6 +15,8 @@ import tempfile
 from collections import Counter, defaultdict
 from pathlib import Path
 
+from label_metadata import read_label_names
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -97,19 +99,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def read_labels(labels_path: Path) -> list[str]:
-    labels = []
-    for raw_line in labels_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        name = re.split(r"[:：]", line, maxsplit=1)[0].strip()
-        if name:
-            labels.append(name)
-    if not labels:
-        raise RuntimeError(f"No labels found in {labels_path}")
-    if len(labels) != len(set(labels)):
-        raise RuntimeError(f"Duplicate label names in {labels_path}: {labels}")
-    return labels
+    return read_label_names(labels_path)
 
 
 def require_fast_image_deps() -> None:
@@ -160,14 +150,18 @@ def mask_bbox(mask_path: Path, min_mask_pixels: int, min_box_size: int) -> tuple
     return width, height, x1, y1, x2, y2, area
 
 
-def mask_metrics(mask_path: Path) -> dict | None:
+def mask_metrics(mask_path: Path, target_value: int | None = None) -> dict | None:
     import cv2
     import numpy as np
 
     mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
     if mask is None:
         raise RuntimeError(f"Failed to read mask {mask_path}")
-    binary = (mask > 0).astype(np.uint8)
+    binary = (
+        (mask > 0).astype(np.uint8)
+        if target_value is None
+        else (mask == target_value).astype(np.uint8)
+    )
     height, width = binary.shape
     area = int(cv2.countNonZero(binary))
     if area == 0:
@@ -192,15 +186,24 @@ def mask_metrics(mask_path: Path) -> dict | None:
     }
 
 
-def mask_polygon_label(mask_path: Path, class_id: int, min_mask_pixels: int, min_box_size: int) -> str | None:
+def mask_polygon_label(
+    mask_path: Path,
+    class_id: int,
+    min_mask_pixels: int,
+    min_box_size: int,
+    target_value: int | None = None,
+) -> str | None:
     import cv2
 
     mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
     if mask is None:
         raise RuntimeError(f"Failed to read mask {mask_path}")
-    if int((mask > 0).sum()) < min_mask_pixels:
+    binary = mask > 0 if target_value is None else mask == target_value
+    if int(binary.sum()) < min_mask_pixels:
         return None
-    contours, _ = cv2.findContours((mask > 0).astype("uint8"), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(
+        binary.astype("uint8"), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
     if not contours:
         return None
     contour = max(contours, key=cv2.contourArea)
@@ -277,7 +280,8 @@ def discover_videos(input_dir: Path) -> list[dict]:
             {
                 "name": video_name,
                 "prompt_path": prompt_path,
-                "mask_dir": prompt_path.parent / "object_mask_frames",
+                "object_mask_dir": prompt_path.parent / "object_mask_frames",
+                "class_mask_dir": prompt_path.parent / "mask_frames",
                 "video_path": video_path,
                 "frame_count": int(data["frame_count"]),
                 "obj_to_name": obj_to_name,
@@ -381,15 +385,30 @@ def build_video_annotations(
 ) -> tuple[dict[int, list[str]], dict[int, Counter], set[int], list[dict]]:
     mask_records = []
     areas_by_object: dict[int, dict[int, int]] = defaultdict(dict)
-    for mask_path in sorted(video["mask_dir"].glob("*_obj*.png")):
-        frame_text, obj_text = mask_path.stem.split("_obj")
-        frame_idx = int(frame_text)
-        obj_id = int(obj_text)
+    object_mask_paths = sorted(video["object_mask_dir"].glob("*_obj*.png"))
+    if object_mask_paths:
+        mask_inputs = []
+        for mask_path in object_mask_paths:
+            frame_text, obj_text = mask_path.stem.split("_obj")
+            mask_inputs.append((mask_path, int(frame_text), int(obj_text), None))
+    else:
+        class_mask_paths = sorted(video["class_mask_dir"].glob("*.png"))
+        if len(class_mask_paths) != video["frame_count"]:
+            raise RuntimeError(
+                f"{video['name']}: found neither object masks nor a complete class-mask set"
+            )
+        mask_inputs = [
+            (mask_path, int(mask_path.stem), obj_id, obj_id)
+            for mask_path in class_mask_paths
+            for obj_id in sorted(video["obj_to_name"])
+        ]
+
+    for mask_path, frame_idx, obj_id, target_value in mask_inputs:
         obj_name = video["obj_to_name"].get(obj_id)
         if obj_name not in class_to_id:
             skipped_masks["unknown_class"] += 1
             continue
-        metrics = mask_metrics(mask_path)
+        metrics = mask_metrics(mask_path, target_value)
         if metrics is None:
             skipped_masks["empty"] += 1
             continue
@@ -406,6 +425,7 @@ def build_video_annotations(
             "obj_id": obj_id,
             "obj_name": obj_name,
             "metrics": metrics,
+            "target_value": target_value,
         }
         mask_records.append(record)
         areas_by_object[obj_id][frame_idx] = metrics["area"]
@@ -461,6 +481,7 @@ def build_video_annotations(
                 class_id,
                 args.min_mask_pixels,
                 args.min_box_size,
+                record["target_value"],
             )
             if label_line is None:
                 skipped_masks["invalid_polygon"] += 1

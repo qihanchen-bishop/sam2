@@ -33,11 +33,13 @@ For training, install a CUDA-enabled PyTorch build if you want GPU acceleration.
 ```
 
 The converter recursively discovers all `file-*_sam2_masks` directories under
-the input root, including both front and side views. It reads:
+the input root, including both front and side views. It reads either compact
+class masks or legacy per-object masks:
 
 - the class name before `:` or `：` on each line of `labels.txt`
 - `file-*_sam2_masks/sam2_prompts.json`
-- `file-*_sam2_masks/object_mask_frames/*_obj*.png`
+- `file-*_sam2_masks/mask_frames/*.png` (preferred)
+- `file-*_sam2_masks/object_mask_frames/*_obj*.png` (legacy fallback)
 
 It extracts clean images from the original videos listed in `sam2_prompts.json`;
 it does not train on `mask_visual_frames`.
@@ -110,7 +112,10 @@ env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
 
 The higher side-view tool threshold reduces false prompts on the static black
 background. Prompt generation skips existing JSON files unless `--overwrite`
-is supplied.
+is supplied. By default, prompts from different classes are assigned distinct
+nearby detector-observed frames. This prevents occasional blocky one-frame
+SAM2 artifacts when many classes use boxes on the same conditioning frame; use
+`--no-stagger-prompt-frames` only for controlled comparisons.
 
 Validate and propagate all prompts with one SAM2 model load:
 
@@ -125,11 +130,31 @@ python tools/sam2_prompts_to_masks.py \
   --output-root /home/qihan/data/sam2/segdata/temp/newdata_3object/final_work/sam2_masks \
   --sam2-checkpoint checkpoints/sam2.1_hiera_base_plus.pt \
   --sam2-config configs/sam2.1/sam2.1_hiera_b+.yaml \
-  --device cuda:0
+  --device cuda:0 \
+  --save-bidirectional
 ```
 
 Completed videos are skipped automatically, so the propagation command is safe
-to resume after interruption. Do not add `--overwrite` for a normal resume.
+to resume after interruption. `--save-bidirectional` preserves independent
+forward and reverse class masks over their common prompt interval for quality
+evaluation. Do not add `--overwrite` for a normal resume.
+
+For a large dataset, run deterministic shards in separate terminals. Each
+prompt belongs to exactly one shard, so processes do not share an output:
+
+```bash
+for shard in 0 1 2 3; do
+  python tools/sam2_prompts_to_masks.py \
+    --prompt-root /path/to/temp/DATASET/final_work/prompts \
+    --output-root /path/to/temp/DATASET/final_work/sam2_masks \
+    --sam2-checkpoint checkpoints/sam2.1_hiera_base_plus.pt \
+    --device cuda:0 \
+    --save-bidirectional \
+    --num-shards 4 \
+    --shard-index "$shard" &
+done
+wait
+```
 
 Confirm that both stages contain 600 completed videos:
 
@@ -140,7 +165,31 @@ find /home/qihan/data/sam2/segdata/temp/newdata_3object/final_work/sam2_masks \
   -name complete.json | wc -l
 ```
 
-After both counts reach 600, create the final LeRobot dataset copy:
+## 4. Evaluate Segmentation Quality
+
+Evaluate temporal IoU with both neighboring frames, area changes, normalized
+centroid displacement, connected-component count, and independent
+forward/reverse propagation IoU:
+
+```bash
+python tools/yolo_sam2/evaluate_segmentation_quality.py \
+  --dataset-root /path/to/origin/DATASET \
+  --seg-root /path/to/temp/DATASET/final_work/sam2_masks \
+  --labels /path/to/origin/DATASET/labels.txt \
+  --output-root /path/to/temp/DATASET/final_work/segmentation_quality \
+  --review-count 24 \
+  --overwrite
+```
+
+The output contains one frame-aligned NPZ per view/class, `summary.json`, a
+per-video summary, and contact sheets of the lowest-scoring frames. Frames below
+the combined score threshold have `uncertain=true`, which downstream training
+can use as a filter.
+
+## 5. Export the Final LeRobot Dataset
+
+After prompt, mask, and quality counts are complete and the review sheets have
+been checked, create the final LeRobot dataset copy:
 
 ```bash
 python tools/yolo_sam2/convert_sam2_masks_to_lerobot.py \
@@ -155,3 +204,10 @@ python tools/yolo_sam2/convert_sam2_masks_to_lerobot.py \
 
 The final copy preserves the original LeRobot dataset and adds eight video
 features: four binary masks for each of the front and side views.
+
+Keep the quality arrays alongside the final dataset:
+
+```bash
+cp -a /path/to/temp/DATASET/final_work/segmentation_quality \
+  /path/to/final/DATASET/segmentation_quality
+```

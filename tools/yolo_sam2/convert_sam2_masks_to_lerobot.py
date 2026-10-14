@@ -14,6 +14,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+from label_metadata import read_label_names
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -35,6 +37,23 @@ def parse_args() -> argparse.Namespace:
         help="Source RGB video key to export; repeat for multiple views.",
     )
     parser.add_argument("--crf", default="18")
+    parser.add_argument(
+        "--include-mask-visual",
+        action="store_true",
+        help=(
+            "Copy each SAM2 colored mask-only video under "
+            "review/mask_visual for manual inspection."
+        ),
+    )
+    parser.add_argument(
+        "--drop-unselected-source-videos",
+        action="store_true",
+        help=(
+            "Make the exported dataset single-/selected-view only: source video "
+            "keys not passed with --video-key are omitted from the copied videos "
+            "and removed from info, stats, and episode metadata."
+        ),
+    )
     parser.add_argument("--allow-missing", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -52,19 +71,7 @@ def write_json(path: Path, data: dict[str, Any]) -> None:
 
 
 def read_labels(path: Path) -> list[str]:
-    labels = []
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        name = re.split(r"[:：]", line, maxsplit=1)[0].strip()
-        if name:
-            labels.append(name)
-    if not labels:
-        raise RuntimeError(f"No labels found in {path}")
-    if len(labels) != len(set(labels)):
-        raise RuntimeError(f"Duplicate labels in {path}: {labels}")
-    return labels
+    return read_label_names(path)
 
 
 def normalized_label(label: str) -> str:
@@ -98,7 +105,12 @@ def resolve_labels_path(
     raise RuntimeError("Could not find labels.txt; pass --labels explicitly")
 
 
-def copy_dataset(source_root: Path, output_root: Path, overwrite: bool) -> None:
+def copy_dataset(
+    source_root: Path,
+    output_root: Path,
+    overwrite: bool,
+    dropped_video_keys: set[str],
+) -> None:
     if output_root.exists():
         if not overwrite:
             raise RuntimeError(
@@ -106,12 +118,17 @@ def copy_dataset(source_root: Path, output_root: Path, overwrite: bool) -> None:
             )
         shutil.rmtree(output_root)
 
-    def ignore(_directory: str, names: list[str]) -> set[str]:
-        return {
+    videos_root = (source_root / "videos").resolve()
+
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        ignored = {
             name
             for name in names
             if name in {"seg", "yolo", "outputs", "runs", "temp", "final"}
         }
+        if Path(directory).resolve() == videos_root:
+            ignored.update(name for name in names if name in dropped_video_keys)
+        return ignored
 
     shutil.copytree(source_root, output_root, ignore=ignore)
 
@@ -167,6 +184,7 @@ def discover_sam2_outputs(
                 "file_index": file_index,
                 "frame_count": frame_count,
                 "mask_dir": mask_dir,
+                "mask_visual": prompt_path.parent / "mask_visual.mp4",
             }
         )
     if not records:
@@ -301,7 +319,9 @@ def mask_stats(positive_pixels: int, total_pixels: int) -> dict[str, Any]:
 
 
 def update_episode_video_metadata(
-    output_root: Path, generated_by_source: dict[str, list[str]]
+    output_root: Path,
+    generated_by_source: dict[str, list[str]],
+    dropped_video_keys: set[str],
 ) -> None:
     import pandas as pd
 
@@ -312,6 +332,19 @@ def update_episode_video_metadata(
         )
     for path in episode_paths:
         frame = pd.read_parquet(path)
+        dropped_prefixes = tuple(
+            prefix
+            for key in sorted(dropped_video_keys)
+            for prefix in (f"videos/{key}/", f"stats/{key}/")
+        )
+        if dropped_prefixes:
+            frame = frame.drop(
+                columns=[
+                    column
+                    for column in frame.columns
+                    if column.startswith(dropped_prefixes)
+                ]
+            )
         for source_key, generated_keys in generated_by_source.items():
             for suffix in ("chunk_index", "file_index", "from_timestamp", "to_timestamp"):
                 source_column = f"videos/{source_key}/{suffix}"
@@ -341,6 +374,16 @@ def main() -> None:
     labels = read_labels(labels_path)
     records = discover_sam2_outputs(seg_root, source_root, args.video_key)
 
+    available_source_video_keys = {
+        path.name for path in (source_root / "videos").iterdir() if path.is_dir()
+    }
+    selected_source_video_keys = set(args.video_key) or available_source_video_keys
+    dropped_video_keys = (
+        available_source_video_keys - selected_source_video_keys
+        if args.drop_unselected_source_videos
+        else set()
+    )
+
     expected = expected_source_videos(source_root, args.video_key)
     actual = {
         (record["video_key"], record["chunk_index"], record["file_index"])
@@ -357,11 +400,14 @@ def main() -> None:
             "Finish segmentation or pass --allow-missing."
         )
 
-    copy_dataset(source_root, output_root, args.overwrite)
+    copy_dataset(source_root, output_root, args.overwrite, dropped_video_keys)
     info_path = output_root / "meta" / "info.json"
     stats_path = output_root / "meta" / "stats.json"
     info = read_json(info_path)
     stats = read_json(stats_path)
+    for key in dropped_video_keys:
+        info["features"].pop(key, None)
+        stats.pop(key, None)
     fps = int(info["fps"])
 
     generated_by_source: dict[str, list[str]] = {}
@@ -369,6 +415,7 @@ def main() -> None:
         lambda: {"positive": 0, "total": 0}
     )
     dimensions: dict[str, tuple[int, int]] = {}
+    copied_mask_visuals = 0
     for source_key in sorted({record["video_key"] for record in records}):
         feature = info["features"].get(source_key)
         if not feature or feature.get("dtype") != "video":
@@ -412,6 +459,21 @@ def main() -> None:
             )
             totals[generated_key]["positive"] += positive
             totals[generated_key]["total"] += total
+        if args.include_mask_visual:
+            visual_source = record["mask_visual"]
+            if not visual_source.is_file():
+                raise RuntimeError(f"Missing mask-only visualization: {visual_source}")
+            visual_destination = (
+                output_root
+                / "review"
+                / "mask_visual"
+                / record["video_key"]
+                / f"chunk-{record['chunk_index']:03d}"
+                / f"file-{record['file_index']:03d}.mp4"
+            )
+            visual_destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(visual_source, visual_destination)
+            copied_mask_visuals += 1
 
     for source_key, generated_keys in generated_by_source.items():
         width, height = dimensions[source_key]
@@ -422,7 +484,7 @@ def main() -> None:
                 totals[generated_key]["total"],
             )
 
-    update_episode_video_metadata(output_root, generated_by_source)
+    update_episode_video_metadata(output_root, generated_by_source, dropped_video_keys)
     write_json(info_path, info)
     write_json(stats_path, stats)
     manifest = {
@@ -436,6 +498,17 @@ def main() -> None:
             for key, chunk, file_index in missing
         ],
         "generated_features": generated_by_source,
+        "dropped_source_video_keys": sorted(dropped_video_keys),
+        "review_artifacts": {
+            "mask_visual": {
+                "included": args.include_mask_visual,
+                "count": copied_mask_visuals,
+                "path": (
+                    "review/mask_visual/{video_key}/chunk-{chunk_index:03d}/"
+                    "file-{file_index:03d}.mp4"
+                ),
+            }
+        },
     }
     write_json(output_root / "segmentation_manifest.json", manifest)
     print(f"Done: {output_root}")

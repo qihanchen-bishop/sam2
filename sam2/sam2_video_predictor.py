@@ -549,6 +549,7 @@ class SAM2VideoPredictor(SAM2Base):
         start_frame_idx=None,
         max_frame_num_to_track=None,
         reverse=False,
+        propagate_conditioning_outputs=False,
     ):
         """Propagate the input points across frames to track in the entire video."""
         self.propagate_in_video_preflight(inference_state)
@@ -593,6 +594,31 @@ class SAM2VideoPredictor(SAM2Base):
                     current_out = obj_output_dict[storage_key][frame_idx]
                     device = inference_state["device"]
                     pred_masks = current_out["pred_masks"].to(device, non_blocking=True)
+                    # Output-only tracking on prompted frames. Keep the original
+                    # conditioning outputs and memory intact for later frames.
+                    # Frame zero is handled by the caller with a reverse seed.
+                    other_cond = {
+                        t: out for t, out in obj_output_dict["cond_frame_outputs"].items()
+                        if t != frame_idx
+                    }
+                    if propagate_conditioning_outputs and frame_idx > 0:
+                        tracking_outputs = {
+                            **obj_output_dict,
+                            # A sole annotation must remain as an object-identity
+                            # reference, even when its output is re-predicted.
+                            "cond_frame_outputs": other_cond or obj_output_dict["cond_frame_outputs"],
+                        }
+                        _, pred_masks = self._run_single_frame_inference(
+                            inference_state=inference_state,
+                            output_dict=tracking_outputs,
+                            frame_idx=frame_idx,
+                            batch_size=1,
+                            is_init_cond_frame=False,
+                            point_inputs=None,
+                            mask_inputs=None,
+                            reverse=reverse,
+                            run_mem_encoder=False,
+                        )
                     if self.clear_non_cond_mem_around_input:
                         # clear non-conditioning memory of the surrounding frames
                         self._clear_obj_non_cond_mem_around_input(

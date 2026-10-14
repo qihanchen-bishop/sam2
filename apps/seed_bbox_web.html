@@ -1,0 +1,1346 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>双视角初始框标注</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #10161d; color: #e9eff7; }
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    body { margin: 0; }
+    header { padding: 14px 20px; border-bottom: 1px solid #30404f; background: #18222d; }
+    h1 { font-size: 19px; margin: 0 0 5px; }
+    .muted { color: #a8b8c8; font-size: 13px; overflow-wrap: anywhere; }
+    main { display: grid; grid-template-columns: minmax(280px, 335px) minmax(0, 1fr); gap: 16px; padding: 16px; }
+    .panel { border: 1px solid #30404f; border-radius: 10px; background: #18222d; padding: 14px; }
+    .side { display: flex; flex-direction: column; gap: 14px; }
+    h2 { font-size: 16px; margin: 0 0 12px; }
+    label { display: block; font-size: 13px; color: #bfcbd8; margin: 9px 0 5px; }
+    select, input, textarea, button { font: inherit; }
+    select, input[type=number], textarea { width: 100%; background: #0f1923; border: 1px solid #405163; color: #f0f5fa; border-radius: 6px; padding: 8px; }
+    textarea { resize: vertical; min-height: 160px; line-height: 1.45; }
+    button { background: #26394c; border: 1px solid #486178; color: #eff7ff; border-radius: 6px; padding: 7px 10px; cursor: pointer; }
+    button:hover { background: #34536e; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    button.primary { background: #087ad1; border-color: #2694ea; }
+    button.danger { border-color: #a85a63; color: #ffbec5; }
+    .row { display: flex; gap: 8px; align-items: center; }
+    .row > * { min-width: 0; }
+    .row button { flex: none; }
+    .row input[type=number] { max-width: 95px; }
+    .row input[type=range] { flex: 1; }
+    #labelHint { min-height: 20px; }
+    #frameWrap { overflow: auto; background: #090e13; border: 1px solid #34495d; border-radius: 8px; min-height: 360px; max-height: 76vh; text-align: center; }
+    #canvas { display: block; margin: auto; touch-action: none; cursor: crosshair; }
+    .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+    .toolbar label { margin: 0; }
+    .toolbar input[type=range] { width: 120px; }
+    #status { margin-top: 12px; min-height: 22px; white-space: pre-wrap; color: #a9d7f6; font-size: 13px; }
+    #status.error { color: #ff9fa6; }
+    #frameChips { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 10px; }
+    #frameChips button { font-size: 12px; padding: 4px 7px; }
+    #boxList { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+    .chip { border-radius: 5px; padding: 3px 6px; background: #294053; font-size: 12px; }
+    .chip.active { outline: 2px solid #f2f6fb; }
+    .mode-row { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 12px; }
+    .mode-row label { display: inline-flex; gap: 5px; align-items: center; margin: 0; cursor: pointer; }
+    #pointList { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 9px; }
+    #pointList button { font-size: 12px; padding: 4px 7px; }
+    .help { font-size: 12px; line-height: 1.6; color: #a8b8c8; }
+    #note { min-height: 60px; }
+    .preview-pair { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:12px; margin-top:12px; }
+    .preview-pair canvas { width:100%; background:#090e13; display:block; }
+    .preview-pair h3 { font-size:14px; margin:5px 0; }
+    #lowerPreview[hidden] { display:none; }
+    #lowerPreview .toolbar { margin-top:12px; }
+    #previewTimeline { width:100%; }
+    #finalPreviewPanel { margin-top:20px; padding-top:14px; border-top:1px solid #405163; }
+    .final-edit-layout { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:12px; align-items:start; }
+    .final-edit-view { min-width:0; position:sticky; top:12px; }
+    #componentEditor { min-width:0; margin:0; }
+    #finalPreviewVideo { width:100%; background:#090e13; }
+    #finalDisplayCanvas, #finalEditCanvas { width:100%; height:auto; }
+    @media (max-width:800px) { .final-edit-layout { grid-template-columns:minmax(0,1fr); } .final-edit-view { position:static; } }
+    #propagationLog { max-height: 130px; overflow: auto; white-space: pre-wrap; font-size: 11px; color: #a8b8c8; }
+    @media (max-width: 800px) { main { grid-template-columns: 1fr; } .side { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>双视角初始框标注</h1>
+    <div class="muted" id="datasetPath">正在载入数据集…</div>
+  </header>
+  <main>
+    <div class="side">
+      <section class="panel">
+        <h2>打开数据集</h2>
+        <label for="datasetInput">服务器上的数据集目录</label>
+        <input id="datasetInput" type="text" spellcheck="false" placeholder="/data/qihan/sam2/segdata/origin/数据集名">
+        <label for="workDirInput">标注工作目录（留空自动创建）</label>
+        <input id="workDirInput" type="text" spellcheck="false" placeholder="默认：segdata/temp/数据集名/manual_seed">
+        <label for="viewsInput">两个视角（可选；多视角数据集需填写）</label>
+        <input id="viewsInput" type="text" spellcheck="false" placeholder="front,side">
+        <div class="row" style="margin-top: 11px"><button id="openDataset" class="primary">打开数据集 / 切换工作目录</button></div>
+        <p class="help">填写服务器路径。切换后会载入该目录已有的草稿；原始数据集保持只读。</p>
+      </section>
+      <section class="panel">
+        <h2>选择视频</h2>
+        <label for="view">视角</label><select id="view"></select>
+        <label for="item">任务 / episode / 视频</label><select id="item"></select>
+        <div class="muted" id="itemInfo" style="margin-top: 9px"></div>
+      </section>
+      <section class="panel">
+        <h2>当前视角类别</h2>
+        <label for="label">标注类别</label><select id="label"></select>
+        <div id="labelHint" class="muted"></div>
+        <label style="display:inline-flex; align-items:center; gap:6px; margin-top:11px; cursor:pointer">
+          <input id="showAll" type="checkbox"> Show all（显示全部类别标注）
+        </label>
+        <div class="mode-row" role="group" aria-label="标注模式">
+          <label><input type="radio" name="promptMode" value="box" checked> 包围盒</label>
+          <label><input type="radio" name="promptMode" value="positive"> 内部正点 +</label>
+          <label><input type="radio" name="promptMode" value="negative"> 排除负点 −</label>
+        </div>
+        <div id="boxList"></div>
+        <div id="pointList"></div>
+        <div class="row" style="margin-top: 11px"><button class="danger" id="deleteBox">删除当前帧此类别的框</button></div>
+        <p class="help">框模式拖拽；正点和负点模式单击。点可单独删除。每类每帧支持一个框和多个点；负点需配合该类别的框或正点才会导出。</p>
+      </section>
+      <section class="panel">
+        <h2>两个视角分别维护标签</h2>
+        <div class="muted" id="labelsPath"></div>
+        <div class="muted" id="sourceLabelsPath" style="margin-top: 5px"></div>
+        <div id="syncWarning" style="color:#ffbf7a; font-size:13px; margin-top:8px"></div>
+        <button id="syncLabels" style="margin-top: 9px">从原始 labels.txt 同步</button>
+        <label for="labelsText">每行：类别名: 描述；“视角”行用于镜头说明</label>
+        <textarea id="labelsText" spellcheck="false"></textarea>
+        <div class="row"><button id="saveLabels" class="primary">保存当前视角标签</button></div>
+      </section>
+    </div>
+    <div>
+      <section class="panel">
+        <h2>逐帧标注</h2>
+        <div class="toolbar">
+          <button id="prev10">−10</button><button id="prev1">−1</button>
+          <input id="frame" type="number" min="0" value="0"><span id="frameTotal">/ 0</span>
+          <button id="goFrame">跳转</button><button id="next1">+1</button><button id="next10">+10</button>
+          <label for="zoom">放大</label><input id="zoom" type="range" min="1" max="3" step="0.25" value="1"><span id="zoomValue">1×</span>
+        </div>
+        <div class="row" style="margin-bottom: 10px"><input id="timeline" type="range" min="0" max="1" value="0" style="flex:1"><span id="timeCode" class="muted"></span></div>
+        <div id="frameWrap"><canvas id="canvas"></canvas></div>
+        <p class="help">包围盒拖拽，内部正点和排除负点单击；每次操作自动保存。提示使用原始视频像素坐标。键盘 ←/→ 逐帧，Shift+←/→ 跳 10 帧。</p>
+        <div class="muted">已标注帧（点击跳转）</div><div id="frameChips"></div>
+        <label for="note">当前帧备注（例如：接触前、刚露出、难以判断）</label><textarea id="note"></textarea>
+        <button id="saveNote">保存备注</button>
+        <div id="status"></div>
+        <div class="muted" id="outputPath" style="margin-top: 12px"></div>
+      </section>
+      <section class="panel" style="margin-top: 16px">
+        <h2>视频分割与预览</h2>
+        <label for="segmentationMethod">分割模式</label>
+        <select id="segmentationMethod"><option value="sam2">SAM2 · 提示驱动双向传播</option><option value="unet">U-Net · 直接逐帧分割（前视角）</option></select>
+        <div id="unetWorkflow" hidden>
+          <p><a href="/round-review" target="_blank">打开本轮 U-Net 整段异常诊断与逐帧评分</a></p>
+          <p><a href="/round-data/pseudo8_r2/unet_global_r2/index.html" target="_blank">8 视频迭代：标注预览与异常评分</a> · <a href="/round-data/pseudo8_r2/frame_selection.json" target="_blank">训练帧筛选记录</a></p>
+          <p><a href="/round-data/pseudo24_r3/unet_global_r2/index.html" target="_blank">24 视频迭代：新增 16 + 原有 8，标注与评分</a> · <a href="/round-data/pseudo24_r3/frame_selection.json" target="_blank">24 视频训练帧筛选记录</a></p>
+          <p><a href="/round-data/contact_filter_r1/unet_global_r2/index.html" target="_blank">U-Net 整段稳健趋势与离群帧检查（原始 IoU 曲线版）</a> · <a href="/round-data/contact_filter_r1/unet_global_r1/index.html" target="_blank">上一版诊断对照</a></p>
+          <p class="help">ResNet-18 + U-Net · seed4 第54轮最佳模型 · 输入600×456。无需提示，逐帧预测后在原视频分辨率过滤：删除面积&lt;20的分量、最近距离主分量&gt;自身面积的次分量。左器械1、遮挡物2、region1；右器械和object仅在彼此接触时最多保留2个分量，否则只保留最大分量。接触按清理后掩码距离≤3原图像素判断。预览使用过滤结果，原始预测和旧版本留存，不覆盖SAM2。此处为只读效果预览。</p>
+          <label>计算设备 <select id="unetDevice"></select></label>
+          <button id="unetStart" class="primary" disabled>U-Net 分割当前视频</button>
+          <button id="unetFilter" disabled>过滤已有U-Net结果（不重新推理）</button>
+          <p id="unetStatus" class="help">正在读取状态…</p>
+          <div id="unetResult" hidden>
+            <label>显示类型 <select id="unetDisplay"><option value="overlay">原图叠加</option><option value="segmentation">纯分割</option></select></label>
+            <video id="unetVideo" controls playsinline muted preload="metadata" style="width:100%;max-width:600px;background:#000"></video>
+            <div class="row"><button id="unetPrev">上一帧</button><button id="unetNext">下一帧</button><label>帧号 <input id="unetFrame" type="number" min="0" value="0" style="width:100px"></label><button id="unetGo">跳转</button><span id="unetTime"></span></div>
+            <p id="unetPath" class="help"></p>
+          </div>
+          <pre id="unetLog" style="max-height:130px;overflow:auto;white-space:pre-wrap"></pre>
+        </div>
+        <div id="sam2Workflow">
+        <div class="row">
+          <div style="flex:1"><label for="sam2Model">模型</label><select id="sam2Model"></select></div>
+          <div style="flex:1"><label for="sam2Device">计算设备</label><select id="sam2Device"></select></div>
+        </div>
+        <label for="compileMode">编译加速</label>
+        <select id="compileMode">
+          <option value="none">关闭（立即启动）</option>
+          <option value="encoder">仅图像编码器（首次启动慢）</option>
+          <option value="full">完整视频模型（首次编译很慢）</option>
+        </select>
+        <div class="mode-row">
+          <label><input id="offloadVideo" type="checkbox" checked> 视频帧放 CPU（省显存）</label>
+          <label><input id="offloadState" type="checkbox"> 传播状态放 CPU（省显存，可能变慢）</label>
+        </div>
+        <p class="help">默认 Base+、GPU 状态、CPU 视频帧。Tiny/Small 可用于快速预览；编译适合多次运行，首次会额外耗时。GPU 空闲显存是打开页面时的快照。</p>
+        <button id="propagate" class="primary">传播当前视频</button>
+        <span id="propagationState" class="muted" style="margin-left: 8px">尚无传播结果</span>
+        <p class="help">默认正反双向整合传播：保留条件记忆、重新预测提示帧并优化首帧。完成后提示方向分歧，由你选择最终结果。分歧只表示两者不同，不代表某个方向一定错误。</p>
+        <div id="directionReview" hidden>
+          <h3>整段修正 · 正反向结果选择</h3>
+          <button id="reanalyzeDirections" hidden>自动计算冲突</button>
+          <p id="conflictSummary" class="help"></p>
+          <label for="conflictInterval">冲突片段（选择后跳转到起始帧）</label>
+          <select id="conflictFilter"><option value="C">连通分量冲突</option><option value="other">其他冲突（IoU）</option></select>
+          <select id="conflictInterval"></select>
+          <label><input type="checkbox" id="unselectedConflictsOnly"> 只显示未选择片段</label>
+          <p id="conflictFilterStatus" class="help"></p>
+          <button id="jumpConflict">跳到所选片段</button>
+          <div class="row"><button id="chooseForward">本片段用正向</button><button id="chooseReverse">本片段用反向</button></div>
+          <div class="row"><button id="chooseAllForward">整段用正向</button><button id="chooseAllReverse">整段用反向</button></div>
+          <p class="help">可逐片段选择，也可直接选择整段方向。未标记冲突的帧默认用正向；“整段用反向”会一并切换这些帧。全部选完后，点击下方按钮生成最终视频。</p>
+          <button id="finalizeDirections" class="primary">确认选择并生成最终结果</button>
+          <h4>标记待单帧修正的位置</h4>
+          <button id="markLowerFrame">标记当前正反向预览帧</button>
+          <label>指定帧号 <input id="markFrameNumber" type="number" min="0" value="0" style="width:100px"></label><button id="markSpecifiedFrame">添加标记</button>
+          <select id="reviewMarkedFrames"></select><button id="jumpMarkedCandidate">预览标记帧</button><button id="removeMarkedFrame">移除标记</button>
+          <p id="markFrameStatus" class="help"></p>
+        </div>
+        <label for="previewMode">下方预览模式（左右同步）</label>
+        <select id="previewMode"><option value="segmentation">纯分割（黑色背景）</option><option value="overlay" selected>原图叠加</option></select>
+        <div class="row" id="opacityControls"><label for="maskOpacity">叠加透明度</label><input id="maskOpacity" type="range" min="0.1" max="1" step="0.05" value="0.5"><span id="maskOpacityValue">50%</span></div>
+        <div id="lowerPreview" hidden>
+          <p id="componentCountDetails" class="help"></p>
+          <div class="preview-pair">
+            <div><h3 id="forwardTitle">正向传播（只读对比）</h3><canvas id="forwardCanvas"></canvas></div>
+            <div><h3>反向传播（只读对比）</h3><canvas id="reverseCanvas"></canvas><p id="reverseUnavailable" class="help" hidden>此版本没有反向结果，请重新双向传播。</p></div>
+          </div>
+          <div class="toolbar">
+            <button id="previewPlay">同步播放</button><button id="previewPrev">上一帧</button><button id="previewNext">下一帧</button>
+            <label>预览帧 <input id="previewFrame" type="number" min="0" value="0" style="width:100px"></label>
+            <button id="previewGo">跳转预览</button><span id="previewTime" class="muted"></span>
+            <label>速度 <select id="previewSpeed"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option></select></label>
+          </div>
+          <input id="previewTimeline" type="range" min="0" max="0" value="0">
+          <div id="previewMessage" class="muted"></div>
+          <section id="finalPreviewPanel">
+            <h3>正反向差异 / 合并结果预览</h3>
+            <label>预览内容 <select id="resultPreviewSource"><option value="difference">正反向差异图（合并前可用）</option><option value="merged">合并结果</option></select></label>
+            <p id="finalPreviewStatus" class="help">先完成整段冲突选择并生成合并结果，再进行单帧修正。</p>
+            <div class="final-edit-layout">
+            <div class="final-edit-view">
+            <section id="differencePanel">
+              <div class="toolbar"><label><input id="differenceFollow" type="checkbox" checked> 跟随上方正反向预览帧</label><label>差异帧 <input id="differenceFrame" type="number" min="0" value="0" style="width:105px"></label><button id="differencePrev">上一帧</button><button id="differenceNext">下一帧</button><button id="differenceGo">跳转差异帧</button><label><input id="differenceOverlay" type="checkbox" checked> 叠加原图</label></div>
+              <p class="help"><span style="color:#ff643c">橙色：仅正向有前景</span> · <span style="color:#1ec8ff">青色：仅反向有前景</span> · <span style="color:#d250ff">紫色：双方均有前景但类别不同</span>。相同像素不着色。使用最新候选原始掩码逐像素比较，不受冲突阈值限制；此图不代表哪个方向正确。播放时抽帧刷新，暂停后精确到帧。</p>
+              <canvas id="differenceCanvas" style="width:100%;background:#000"></canvas><p id="differenceStatus" class="help"></p>
+            </section>
+            <div class="row" id="finalModeControls"><label>合并结果显示 <select id="finalDisplayMode"><option value="segmentation">纯分割</option><option value="overlay" selected>原图叠加</option></select></label><label id="finalOpacityControls">透明度 <input id="finalOpacity" type="range" min="0.1" max="1" step="0.05" value="0.5"></label></div>
+            <canvas id="finalDisplayCanvas" hidden></canvas>
+            <div id="finalPlaybackControls" class="toolbar" hidden>
+              <button id="finalPlay">播放合并结果</button><button id="finalPrev">上一帧</button><button id="finalNext">下一帧</button>
+              <label>帧号 <input id="finalFrame" type="number" min="0" value="0" style="width:100px"></label><button id="finalGo">跳转</button>
+              <input id="finalTimeline" type="range" min="0" max="0" value="0" style="flex:1"><span id="finalTime" class="help"></span>
+            </div>
+            <video id="finalPreviewVideo" preload="auto" muted playsinline hidden></video>
+            <video id="finalSourceVideo" preload="auto" muted playsinline hidden></video>
+            <canvas id="finalEditCanvas" style="touch-action:none;cursor:crosshair" hidden></canvas>
+            <div><a id="finalPreviewLink" target="_blank" hidden>在新窗口打开最终视频</a></div>
+            </div>
+          <details id="componentEditor"><summary>单帧修正 · 面积清理 / 填洞 / 鼠标编辑</summary>
+            <label>修正类别 <select id="repairClass"></select></label>
+            <details><summary>区间统一处理 · 保留最大连通分量 / 填充孔洞</summary>
+              <div class="row"><label>起始帧 <input id="batchStart" type="number" min="0" step="1" value="0"></label><label>结束帧 <input id="batchEnd" type="number" min="0" step="1" value="0"></label></div>
+              <p class="help">包含起止帧，仅处理上方所选类别。填洞只填完全封闭且全为背景的孔洞，不覆盖其他类别，不填通向画面边界的空隙；空类别保持为空。两种操作均保存新版本，不重新传播。</p>
+              <button id="batchLargest" disabled>区间保留最大分量并保存</button>
+              <button id="batchFillHoles" disabled>区间一键填洞并保存</button>
+              <p id="batchStatus" class="help"></p>
+            </details>
+            <p class="help">只修改合并结果，不修改正反向候选或方向选择。不再自动检测：从人工标记列表选择帧，或直接输入帧号。先合并，再进行最后修正。</p>
+            <select id="finalMarkedFrames"></select><button id="editMarkedFrame">跳转并编辑标记帧</button><button id="markFinalFrame">标记当前合并帧</button><button id="markFrameDone">将当前帧标记为已完成</button>
+            <div class="toolbar"><button id="componentLoad">编辑合并视频当前帧</button></div>
+            <div class="toolbar">
+              <button id="editPrevFrame">编辑上一帧</button><button id="editNextFrame">编辑下一帧</button>
+              <label>编辑帧号 <input id="editFrameNumber" type="number" min="0" step="1" value="0" style="width:100px"></label>
+              <button id="editGoFrame">跳转并继续编辑</button>
+            </div>
+            <p class="help">在这里跳帧会直接载入目标帧编辑，保留当前类别；各帧草稿自动暂存，不用退出编辑。</p>
+            <p class="help">操作先进入当前帧／类别草稿；切换帧继续编辑，最后统一保存全部修改。普通视频显示已保存结果，草稿返回编辑时可见。填洞只填背景，不覆盖其他类别。</p>
+            <button id="componentExit">退出编辑（保留多帧草稿）</button>
+            <p id="multiDraftStatus" class="help"></p>
+            <select id="multiDraftList"></select><button id="multiDraftGo">返回草稿帧</button><button id="multiDraftDiscard">清空全部草稿</button>
+            <p id="componentContext" class="help"></p>
+            <div class="toolbar"><button id="componentFillAll" disabled>当前帧一键填充孔洞</button><button id="componentLargest" disabled>当前帧一键保留最大连通分量</button></div>
+            <div class="row"><label>去除分量面积 ≤ <input id="repairRemove" type="number" min="0" step="1" value="0"></label><label>填补孔洞面积 ≤ <input id="repairFill" type="number" min="0" step="1" value="0"></label></div>
+            <label><input id="repairKeep" type="checkbox" checked> 保留该类别最大连通分量</label>
+            <button id="repairApply" disabled>预览面积清理 / 填洞</button>
+            <p class="help">面积按原图像素数，0 表示关闭。只填背景孔洞，不覆盖其他类别。各帧编辑可独立撤销草稿一步，最后统一保存全部修改。</p>
+            <div class="toolbar">
+              <label>鼠标模式 <select id="componentMode"><option value="select">点选分量</option><option value="cut">画线切开</option><option value="paint">填充画笔</option><option value="erase">删除画笔（当前类别）</option></select></label>
+              <label>笔触大小（原图像素）<input id="componentWidth" type="number" min="1" max="200" step="1" value="3" style="width:85px"></label>
+              <label><input id="paintOverwrite" type="checkbox">填充画笔可覆盖其他类别（取消则仅填背景）</label>
+              <span class="help">显示方式使用上方“合并结果显示”，切换不会改变草稿。</span>
+              <button id="componentDelete" disabled>删除选中分量</button>
+            </div>
+            <div id="componentList" class="toolbar"></div>
+            <div class="toolbar">
+              <button id="componentUndo" disabled>撤销草稿一步</button>
+              <button id="componentSave" class="primary" disabled>保存全部帧修改</button>
+              <button id="componentDiscardCurrent" disabled>撤销当前帧／类别全部草稿</button>
+              <button id="repairUndo">撤销上次已保存修正</button>
+            </div>
+            <p id="componentStatus" class="help"></p>
+            <p id="repairStatus" class="help"></p>
+            <p class="help">保存只更新合并结果版本和对应预览，不重跑 SAM2，不重算冲突，不自动检测。保留已确认的方向选择、人工标记和历史版本。</p>
+          </details>
+            </div>
+          </section>
+        </div>
+        <video id="previewVideo" preload="auto" muted playsinline hidden></video>
+        <video id="forwardVideo" preload="auto" muted playsinline hidden></video>
+        <video id="reverseVideo" preload="auto" muted playsinline hidden></video>
+        <div class="muted" id="previewPath"></div>
+        <pre id="propagationLog"></pre>
+        </div>
+      </section>
+    </div>
+  </main>
+  <script>
+    const el = id => document.getElementById(id);
+    const canvas = el('canvas'), ctx = canvas.getContext('2d');
+    let app = null, item = null, draft = null, currentFrame = 0, image = null, maskImage = null, preview = null, maskLoading = 0, previewRun = '', dragStart = null, dragEnd = null, dragClient = null, dragMode = null, loading = 0, busy = false, workspaceEpoch = 0;
+    const previewVideos = [el('previewVideo'), el('forwardVideo'), el('reverseVideo')];
+    let unetPreview=null, unetMediaKey='', unetRequestBusy=false;
+    function resetUnet(){
+      unetPreview=null;unetMediaKey='';
+      el('unetVideo').pause();el('unetVideo').removeAttribute('src');el('unetVideo').load();
+      el('unetResult').hidden=true;el('unetPath').textContent='';el('unetLog').textContent='';
+      el('unetStart').disabled=true;el('unetStatus').textContent='正在读取状态…';
+      el('unetFilter').disabled=true;
+    }
+    function updateUnetMedia(){
+      el('unetResult').hidden=!unetPreview;
+      if(!unetPreview || !item)return;
+      const mode=el('unetDisplay').value, key=`${app.workspace_id}/${item.item_id}/${unetPreview.run_id}/${mode}`;
+      if(key===unetMediaKey)return;
+      const video=el('unetVideo'),same=unetMediaKey.startsWith(`${app.workspace_id}/${item.item_id}/${unetPreview.run_id}/`);
+      const time=same?video.currentTime:0;
+      video.pause();unetMediaKey=key;
+      video.onloadedmetadata=()=>{if(key===unetMediaKey){video.currentTime=Math.min(time,Math.max(0,(unetPreview.frame_count-1)/unetPreview.fps));updateUnetTime();}};
+      video.src=`/api/unet-video?workspace_id=${encodeURIComponent(app.workspace_id)}&id=${encodeURIComponent(item.item_id)}&run=${unetPreview.run_id}&mode=${mode}`;
+      video.load();el('unetFrame').max=unetPreview.frame_count-1;
+      el('unetPath').textContent=`独立U-Net结果：${unetPreview.output_path}`;
+    }
+    function updateUnetTime(){
+      if(!unetPreview)return;
+      const frame=Math.min(unetPreview.frame_count-1,Math.floor(el('unetVideo').currentTime*unetPreview.fps+1e-4));
+      if(document.activeElement!==el('unetFrame'))el('unetFrame').value=frame;
+      el('unetTime').textContent=`第 ${frame} / ${unetPreview.frame_count-1} 帧`;
+    }
+    function unetSeek(frame){
+      if(!unetPreview || !Number.isInteger(frame))return;
+      const v=el('unetVideo');v.pause();
+      v.currentTime=(Math.max(0,Math.min(unetPreview.frame_count-1,frame))+.001)/unetPreview.fps;
+      el('unetFrame').value=Math.max(0,Math.min(unetPreview.frame_count-1,frame));
+    }
+    function renderUnet(data){
+      unetPreview=data.unet_preview || null;
+      const job=data.job,globalJob=data.propagation_job;
+      const running=globalJob?.state==='running'||job?.state==='running';
+      el('unetStart').disabled=unetRequestBusy || !data.supports_unet || item?.view!=='front' || running;
+      el('unetFilter').disabled=el('unetStart').disabled || !unetPreview || !data.unet_filter_version;
+      el('unetStatus').textContent=!data.supports_unet?'U-Net 后端尚未启用，请等待服务更新':item?.view!=='front'?'当前模型只支持front前视角':job?.kind==='unet'&&job.state==='running'?'U-Net正在逐帧分割和生成预览…':job?.kind==='unet'&&job.state==='failed'?`分割失败：${job.error}`:running?'有分割或当前视频修改任务运行中，请等待完成':unetPreview?`分割完成：${unetPreview.frame_count} 帧 · ${Math.round(unetPreview.seconds)} 秒`:'尚无U-Net结果，可以直接分割，无需标注提示';
+      el('unetLog').textContent=job?.kind==='unet'?(job.log_tail||''):'';
+      if(unetPreview)el('unetStatus').textContent+=(data.unet_filter_version && unetPreview.component_filter?.version===data.unet_filter_version)?' · 当前预览已应用连通分量过滤':' · 当前为旧结果，请点击过滤已有结果';
+      updateUnetMedia();
+    }
+    el('segmentationMethod').onchange=()=>{
+      const unet=el('segmentationMethod').value==='unet';
+      el('unetWorkflow').hidden=!unet;el('sam2Workflow').hidden=unet;
+      if(unet){for(const v of document.querySelectorAll('#sam2Workflow video'))v.pause();}
+      else el('unetVideo').pause();
+      refreshPropagation();
+    };
+    el('unetDisplay').onchange=updateUnetMedia;
+    el('unetVideo').ontimeupdate=updateUnetTime;
+    el('unetPrev').onclick=()=>unetSeek(Math.floor(el('unetVideo').currentTime*(unetPreview?.fps||30)+1e-4)-1);
+    el('unetNext').onclick=()=>unetSeek(Math.floor(el('unetVideo').currentTime*(unetPreview?.fps||30)+1e-4)+1);
+    el('unetGo').onclick=()=>unetSeek(Number(el('unetFrame').value));
+    el('unetFrame').onkeydown=e=>{if(e.key==='Enter')unetSeek(Number(el('unetFrame').value));};
+    async function submitUnet(filterExisting){
+      if(!item || el(filterExisting?'unetFilter':'unetStart').disabled)return;
+      if(multiDrafts.size || multiSavePending){el('unetStatus').textContent='请先保存或清空SAM2编辑草稿';return;}
+      const epoch=workspaceEpoch, id=item.item_id;
+      unetRequestBusy=true;el('unetStart').disabled=true;el('unetFilter').disabled=true;
+      try{await api('/api/unet-segment',{workspace_id:app.workspace_id,item_id:id,device:el('unetDevice').value,filter_existing:filterExisting});}
+      catch(error){if(epoch===workspaceEpoch&&id===item?.item_id)el('unetStatus').textContent=error.message;return;}
+      finally{unetRequestBusy=false;}
+      await refreshPropagation();
+    };
+    el('unetStart').onclick=()=>submitUnet(false);
+    el('unetFilter').onclick=()=>submitUnet(true);
+    const overlayBuffer = document.createElement('canvas');
+    const overlayContext = overlayBuffer.getContext('2d', {willReadFrequently:true});
+    let lowerFrame = 0, lowerEpoch = 0, lowerMasks = {}, lowerSeeking = false, finalPreviewKey = '';
+    let finalExact=null, finalExactEpoch=0;
+    const finalMaskBuffer=document.createElement('canvas');
+    function finalFrameIndex(){return item?Math.min(item.frame_count-1,Math.floor(el('finalPreviewVideo').currentTime*item.fps+.001)):0;}
+    function loadFinalExact(){
+      if(preview?.direction_review?.status!=='finalized' || !el('finalPreviewVideo').paused || componentActive)return;
+      const frame=finalFrameIndex(),key=finalPreviewKey,epoch=++finalExactEpoch;
+      const raw=new Image(),mask=new Image();
+      const ready=()=>{if(epoch===finalExactEpoch && key===finalPreviewKey && raw.complete && raw.naturalWidth && mask.complete && mask.naturalWidth){finalExact={frame,key,raw,mask};drawFinalDisplay();}};
+      raw.onload=ready;mask.onload=ready;
+      raw.src=`/api/frame?id=${encodeURIComponent(item.item_id)}&workspace_id=${encodeURIComponent(app.workspace_id)}&frame=${frame}`;
+      mask.src=`/api/preview-frame?${previewQuery()}&frame=${frame}&source=final&revision=${preview.direction_review.revision}`;
+    }
+    function drawFinalDisplay(){
+      if(!item || componentActive || preview?.direction_review?.status!=='finalized')return;
+      const mask=el('finalPreviewVideo'),raw=el('finalSourceVideo'),target=el('finalDisplayCanvas'),c=target.getContext('2d');
+      const w=Math.min(item.width,960),h=Math.round(item.height*w/item.width),overlay=el('finalDisplayMode').value==='overlay';
+      if(target.width!==w || target.height!==h){target.width=w;target.height=h;}
+      c.fillStyle='#000';c.fillRect(0,0,w,h);
+      const exact=mask.paused && finalExact?.key===finalPreviewKey && finalExact.frame===finalFrameIndex()?finalExact:null;
+      if(overlay){if(exact)c.drawImage(exact.raw,0,0,w,h);else if(raw.readyState>=2)c.drawImage(raw,0,0,w,h);}
+      c.save();c.globalAlpha=overlay?Number(el('finalOpacity').value):1;
+      if(exact)c.drawImage(exact.mask,0,0,w,h);
+      else if(mask.readyState>=2){
+        if(!overlay)c.drawImage(mask,0,0,w,h);
+        else{
+          if(finalMaskBuffer.width!==w || finalMaskBuffer.height!==h){finalMaskBuffer.width=w;finalMaskBuffer.height=h;}
+          const bc=finalMaskBuffer.getContext('2d',{willReadFrequently:true});bc.drawImage(mask,0,0,w,h);
+          const pixels=bc.getImageData(0,0,w,h);
+          for(let i=0;i<pixels.data.length;i+=4)pixels.data[i+3]=pixels.data[i]+pixels.data[i+1]+pixels.data[i+2]>24?255:0;
+          bc.putImageData(pixels,0,0);c.drawImage(finalMaskBuffer,0,0);
+        }
+      }
+      c.restore();
+    }
+    function finalAnimation(){
+      const mask=el('finalPreviewVideo'),raw=el('finalSourceVideo');
+      if(item && !mask.paused && !componentActive){
+        if(raw.readyState>=1 && Math.abs(raw.currentTime-mask.currentTime)>1.5/item.fps)raw.currentTime=mask.currentTime;
+        drawFinalDisplay();
+      }
+      requestAnimationFrame(finalAnimation);
+    }
+    requestAnimationFrame(finalAnimation);
+
+    function status(message, error = false) {
+      el('status').textContent = message;
+      el('status').className = error ? 'error' : '';
+    }
+    async function api(url, body) {
+      const response = await fetch(url, body === undefined ? {cache:'no-store'} : {
+        method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+      return result;
+    }
+    function selectedLabels() { return app?.labels[el('view').value]?.parsed || []; }
+    function selectedLabel() { return el('label').value; }
+    function visibleLabels() { return el('showAll').checked ? selectedLabels() : selectedLabels().filter(label => label.name === selectedLabel()); }
+    function selectedMode() { return document.querySelector('input[name="promptMode"]:checked').value; }
+    function frameBoxes() { return draft?.frames[String(currentFrame)] || {}; }
+    function framePoints() { return draft?.points?.[String(currentFrame)] || {}; }
+    function fillLabels() {
+      const view = el('view').value, data = app.labels[view];
+      const previous = el('label').value;
+      el('labelsText').value = data.text;
+      el('labelsPath').textContent = `工作标签：${data.path}`;
+      el('sourceLabelsPath').textContent = `原始标签：${app.label_sources?.[view] || '无'}`;
+      el('syncWarning').textContent = (app.label_sync_warnings || []).filter(message => message.startsWith(`${view}:`)).join('\n');
+      el('label').replaceChildren(...data.parsed.map(label => new Option(label.name, label.name)));
+      if (data.parsed.some(label => label.name === previous)) el('label').value = previous;
+      updateLabelHint();
+    }
+    function updateLabelHint() {
+      const label = selectedLabels().find(entry => entry.name === selectedLabel());
+      el('labelHint').textContent = label?.description || '';
+      render(); loadMaskFrame();
+    }
+    function fillItems() {
+      const view = el('view').value;
+      const rows = app.items.filter(row => row.view === view);
+      el('item').replaceChildren(...rows.map(row => new Option(
+        `${row.episode_index >= 0 ? `ep${String(row.episode_index).padStart(3,'0')} · ` : ''}${row.task} · ${row.annotated_frames} 帧`, row.item_id)));
+      if (rows.length) loadItem(rows[0].item_id);
+    }
+    function loadWorkspace(data) {
+      workspaceEpoch++;
+      app = data; item = null; draft = null; image = null; maskImage = null; preview = null; loading++; maskLoading++;
+      resetPreviewMedia();
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      el('datasetPath').textContent = `${app.dataset} · 工作目录 ${app.work_dir}`;
+      el('datasetInput').value = app.dataset;
+      el('workDirInput').value = '';
+      el('workDirInput').placeholder = `当前：${app.work_dir}；留空按数据集名称自动创建`;
+      el('viewsInput').value = '';
+      el('viewsInput').placeholder = `当前：${app.views.join(',')}；多视角数据集可填写两个视角`;
+      el('view').replaceChildren(...app.views.map(view => new Option(view, view)));
+      const modelNames = {tiny:'Tiny', small:'Small', base_plus:'Base+', large:'Large'};
+      el('sam2Model').replaceChildren(...(app.propagation_options?.models || []).map(model => {
+        const option = new Option(`${modelNames[model.name] || model.name}${model.installed ? '' : '（权重未安装）'}`, model.name);
+        option.disabled = !model.installed;
+        return option;
+      }));
+      el('sam2Model').value = 'base_plus';
+      el('sam2Device').replaceChildren(...(app.propagation_options?.devices || []).map(device => new Option(device.label, device.value)));
+      el('unetDevice').replaceChildren(...(app.propagation_options?.devices || []).map(device => new Option(device.label, device.value)));
+      el('unetDevice').value=[...el('unetDevice').options].some(o=>o.value==='cuda:1')?'cuda:1':'auto';
+      el('sam2Device').value = 'auto';
+      fillLabels(); fillItems();
+    }
+    el('openDataset').onclick = async () => {
+      if(componentBusy || multiSavePending)return status('正在编辑或保存草稿，请稍后切换',true);
+      if(multiDrafts.size && !confirm('切换数据集将丢弃全部未保存的多帧草稿，继续？'))return;
+      if (busy) return status('正在保存，请稍后切换数据集');
+      const labelChanged = app && el('labelsText').value !== app.labels[el('view').value]?.text;
+      const noteChanged = draft && el('note').value !== (draft.notes[String(currentFrame)] || '');
+      if ((labelChanged || noteChanged) && !confirm('当前有未保存的标签说明或帧备注。仍要切换吗？')) return;
+      busy = true;
+      status('正在检查数据集和工作目录…');
+      try {
+        const data = await api('/api/open', {dataset:el('datasetInput').value,
+          work_dir:el('workDirInput').value, views:el('viewsInput').value});
+        busy = false;
+        multiDrafts.clear();
+        loadWorkspace(data);
+        status(`已打开 ${data.dataset}，工作目录：${data.work_dir}`);
+      } catch (error) { status(error.message, true); }
+      finally { busy = false; }
+    };
+    function refreshItemProgress() {
+      if (!item || !draft) return;
+      const row = app.items.find(entry => entry.item_id === item.item_id);
+      if (!row) return;
+      row.annotated_frames = new Set([...Object.keys(draft.frames), ...Object.keys(draft.points || {})]).size;
+      const option = [...el('item').options].find(entry => entry.value === item.item_id);
+      if (option) option.textContent = `${row.episode_index >= 0 ? `ep${String(row.episode_index).padStart(3,'0')} · ` : ''}${row.task} · ${row.annotated_frames} 帧`;
+    }
+    async function loadItem(id) {
+      if(componentBusy || multiSavePending){if(item)el('item').value=item.item_id;return;}
+      if(item?.item_id!==id && multiDrafts.size && !confirm('切换视频将丢弃全部未保存的多帧草稿，继续？')){el('item').value=item.item_id;el('view').value=item.view;return;}
+      if (busy) { if (item) el('item').value = item.item_id; return status('正在保存，请稍后切换视频'); }
+      const epoch = workspaceEpoch, workspaceId = app.workspace_id;
+      try {
+        const result = await api(`/api/item?id=${encodeURIComponent(id)}&workspace_id=${encodeURIComponent(workspaceId)}`);
+        if (epoch !== workspaceEpoch) return;
+        if(item?.item_id!==id)multiDrafts.clear();
+        item = result.item; draft = result.draft; currentFrame = 0; image = null; maskImage = null; preview = null;
+        resetPreviewMedia();
+        el('previewPath').textContent = ''; el('propagationLog').textContent = '';
+        el('item').value = id;
+        el('itemInfo').textContent = `${item.video_key} · ${item.frame_count} 帧 · ${item.width}×${item.height} · ${item.fps.toFixed(1)} fps`;
+        el('frameTotal').textContent = `/ ${item.frame_count - 1}`;
+        el('timeline').max = item.frame_count - 1;
+        el('outputPath').textContent = `自动保存：${result.prompt_path}`;
+        await setFrame(0);
+        await refreshPropagation();
+      } catch (error) { if (epoch === workspaceEpoch) status(error.message, true); }
+    }
+    async function setFrame(number) {
+      if (!item) return;
+      currentFrame = Math.max(0, Math.min(item.frame_count - 1, Math.round(Number(number) || 0)));
+      image = null;
+      maskImage = null; maskLoading++;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      el('frame').value = currentFrame;
+      el('timeline').value = currentFrame;
+      el('timeCode').textContent = item.fps ? `${(currentFrame / item.fps).toFixed(2)} s` : '';
+      el('note').value = draft?.notes[String(currentFrame)] || '';
+      dragStart = dragEnd = dragClient = dragMode = null;
+      updateFrameInfo();
+      const request = ++loading;
+      const workspaceId = app.workspace_id, epoch = workspaceEpoch, itemId = item.item_id, frame = currentFrame;
+      status(`正在读取第 ${currentFrame} 帧…`);
+      const next = new Image();
+      next.onload = () => {
+        if (request !== loading || epoch !== workspaceEpoch) return;
+        image = next; canvas.width = next.naturalWidth; canvas.height = next.naturalHeight;
+        updateZoom(); render(); loadMaskFrame(); status(`第 ${currentFrame} 帧已载入`);
+      };
+      next.onerror = () => { if (request === loading) status(`第 ${currentFrame} 帧读取失败`, true); };
+      next.src = `/api/frame?id=${encodeURIComponent(itemId)}&frame=${frame}&workspace_id=${encodeURIComponent(workspaceId)}`;
+    }
+    function updateZoom() {
+      if (!image) return;
+      const fit = Math.min(1, (el('frameWrap').clientWidth - 18) / image.naturalWidth);
+      const zoom = Number(el('zoom').value);
+      canvas.style.width = `${Math.round(image.naturalWidth * fit * zoom)}px`;
+      canvas.style.height = `${Math.round(image.naturalHeight * fit * zoom)}px`;
+      el('zoomValue').textContent = `${zoom}×`;
+    }
+    function loadMaskFrame() {
+      // Annotation navigation is independent of the lower comparison player.
+      maskImage = null; render();
+    }
+    function resetPreviewMedia() {
+      resetUnet();
+      differenceKey='';differenceData=null;const dc=el('differenceCanvas');dc.getContext('2d').clearRect(0,0,dc.width,dc.height);
+      componentActive=false;
+      previewRun = ''; lowerEpoch++; lowerFrame = 0; lowerMasks = {}; lowerSeeking = false;
+      for (const video of previewVideos) { video.pause(); video.removeAttribute('src'); video.load(); }
+      el('lowerPreview').hidden = true; el('previewPlay').textContent = '同步播放';
+      clearFinalPreview();
+    }
+    function clearFinalPreview() {
+      componentActive=false;el('finalEditCanvas').hidden=true;
+      finalPreviewKey='';
+      const video=el('finalPreviewVideo');video.pause();video.removeAttribute('src');video.load();video.hidden=true;
+      const source=el('finalSourceVideo');source.pause();source.removeAttribute('src');source.load();
+      finalExact=null;finalExactEpoch++;
+      el('finalDisplayCanvas').hidden=true;el('finalPlaybackControls').hidden=true;
+      el('finalPreviewLink').hidden=true;
+      el('finalPreviewStatus').textContent='选择传播方向并生成最终结果后，视频会显示在这里。';
+    }
+    function updateFinalPreview() {
+      const review=preview?.direction_review;
+      el('resultPreviewSource').options[1].disabled=review?.status!=='finalized';
+      if(review?.status!=='finalized') {if(finalPreviewKey)clearFinalPreview();el('resultPreviewSource').value='difference';componentControls();return;}
+      const key=`${item.item_id}/${preview.run_id}/${review.revision}`;
+      if(finalPreviewKey===key)return;
+      if(!finalPreviewKey)el('resultPreviewSource').value='merged';
+      const video=el('finalPreviewVideo'), previousTime=finalPreviewKey.startsWith(`${item.item_id}/${preview.run_id}/`)?video.currentTime:0;
+      componentActive=false;el('finalEditCanvas').hidden=true;
+      finalPreviewKey=key;
+      const url=`/api/preview-video?${previewQuery()}&source=final&revision=${review.revision}`;
+      el('finalPreviewVideo').src=url;el('finalPreviewVideo').hidden=true;
+      el('finalSourceVideo').src=`/api/source-video?${previewQuery()}`;
+      finalExact=null;finalExactEpoch++;el('finalTimeline').max=item.frame_count-1;
+      el('finalDisplayCanvas').hidden=false;el('finalPlaybackControls').hidden=false;
+      video.addEventListener('loadedmetadata',()=>{if(finalPreviewKey===key)video.currentTime=previousTime;},{once:true});
+      el('finalPreviewLink').href=url;el('finalPreviewLink').hidden=false;
+      el('finalPreviewStatus').textContent=`已按人工选择生成，可在此直接播放。保存位置：${preview.output_path}/${review.final_subdir}`;
+    }
+    function activePreviewVideos() { return preview?.direction_review ? previewVideos : previewVideos.slice(0,2); }
+    function previewQuery() {
+      return `id=${encodeURIComponent(item.item_id)}&workspace_id=${encodeURIComponent(app.workspace_id)}&run=${preview.run_id}&candidate=${preview.direction_review?.candidate_revision || 'original'}`;
+    }
+    function formatComponentCounts(rows) {
+      return (rows || []).map(c => {
+        const side = d => {
+          const n = c.counts[d], areas = c.areas?.[d];
+          return `${n}${n > 1 ? (areas ? `（${areas.slice(1).join('、')}）` : '（面积待补充）') : ''}`;
+        };
+        return `${c.class}：正向 ${side('forward')}｜反向 ${side('reverse')}`;
+      }).join('；');
+    }
+    function updateComponentCounts() {
+      const rows = preview?.direction_review?.count_frame_details?.[String(lowerFrame)] || [];
+      el('componentCountDetails').textContent = `第 ${lowerFrame} 帧：${rows.length ? formatComponentCounts(rows) + '。括号为次分量面积，单位：原图像素；不含最大分量。' : '无连通分量数量差异。'}`;
+    }
+    function updateLowerTime() {
+      el('previewFrame').value = lowerFrame; el('previewTimeline').value = lowerFrame;
+      el('previewTime').textContent = `${(lowerFrame / item.fps).toFixed(2)} s / ${((item.frame_count-1)/item.fps).toFixed(2)} s`;
+      updateComponentCounts();
+      renderManualMarks();
+    }
+    function drawLowerPreview() {
+      const raw = el('previewVideo');
+      if (!preview || !item || raw.readyState < 2) return;
+      const width = Math.min(item.width, 960), height = Math.round(item.height * width / item.width);
+      for (const [direction, videoId, canvasId] of [['forward','forwardVideo','forwardCanvas'],['reverse','reverseVideo','reverseCanvas']]) {
+        if (direction === 'reverse' && !preview.direction_review) continue;
+        const target = el(canvasId), c = target.getContext('2d'), mask = el(videoId);
+        if (target.width !== width || target.height !== height) { target.width=width; target.height=height; }
+        const overlay = el('previewMode').value === 'overlay';
+        if (overlay) c.drawImage(raw, 0, 0, width, height);
+        else { c.fillStyle='#000'; c.fillRect(0, 0, width, height); }
+        {
+          const exact = lowerMasks[direction];
+          c.save(); c.globalAlpha = overlay ? Number(el('maskOpacity').value) : 1;
+          if (raw.paused && exact?.frame === lowerFrame) c.drawImage(exact.image, 0, 0, width, height);
+          else if (!overlay && mask.readyState >= 2) c.drawImage(mask, 0, 0, width, height);
+          else if (mask.readyState >= 2) {
+            if (overlayBuffer.width !== width || overlayBuffer.height !== height) { overlayBuffer.width=width; overlayBuffer.height=height; }
+            overlayContext.drawImage(mask, 0, 0, width, height);
+            const pixels = overlayContext.getImageData(0, 0, width, height);
+            for (let i=0; i<pixels.data.length; i+=4) pixels.data[i+3] = pixels.data[i]+pixels.data[i+1]+pixels.data[i+2] > 24 ? 255 : 0;
+            overlayContext.putImageData(pixels, 0, 0); c.drawImage(overlayBuffer, 0, 0);
+          }
+          c.restore();
+        }
+      }
+    }
+    function loadLowerExactMasks() {
+      if (!preview || !item) return;
+      const epoch=++lowerEpoch, frame=lowerFrame, query=previewQuery();
+      for (const direction of preview.direction_review ? ['forward','reverse'] : ['forward']) {
+        const img=new Image(), source=preview.direction_review ? direction : 'final';
+        img.onload=()=>{if(epoch!==lowerEpoch || frame!==lowerFrame) return; lowerMasks[direction]={frame,image:img};drawLowerPreview();};
+        img.onerror=()=>{if(epoch===lowerEpoch) el('previewMessage').textContent='分割叠加读取失败，请刷新预览';};
+        img.src=`/api/preview-frame?${query}&frame=${frame}&source=${source}&revision=${preview.direction_review?.revision || 0}`;
+      }
+    }
+    async function seekLowerPreview(frame) {
+      if (!preview || !item) return;
+      lowerFrame=Math.max(0,Math.min(item.frame_count-1,Math.round(Number(frame)||0)));
+      lowerMasks={}; lowerEpoch++; lowerSeeking=true;
+      const epoch=lowerEpoch, time=(lowerFrame+.1)/item.fps;
+      for(const video of activePreviewVideos()) video.pause();
+      el('previewPlay').textContent='同步播放'; updateLowerTime();
+      await Promise.all(activePreviewVideos().map(video=>new Promise(resolve=>{
+        const seek=()=>{
+          if(epoch!==lowerEpoch) return resolve();
+          if(Math.abs(video.currentTime-time)<.001 && video.readyState>=2) return resolve();
+          video.addEventListener('seeked',resolve,{once:true});video.currentTime=time;
+        };
+        if(video.readyState>=1) seek();else video.addEventListener('loadedmetadata',seek,{once:true});
+      })));
+      if(epoch!==lowerEpoch) return;
+      lowerSeeking=false;drawLowerPreview();loadLowerExactMasks();
+    }
+    function previewAnimation() {
+      const raw=el('previewVideo');
+      if(preview && item && !raw.paused && !lowerSeeking) {
+        lowerFrame=Math.min(item.frame_count-1,Math.floor(raw.currentTime*item.fps+.001));
+        for(const video of activePreviewVideos().slice(1)) if(Math.abs(video.currentTime-raw.currentTime)>1.5/item.fps) video.currentTime=raw.currentTime;
+        updateLowerTime();drawLowerPreview();
+      }
+      requestAnimationFrame(previewAnimation);
+    }
+    requestAnimationFrame(previewAnimation);
+    function updatePreviewMedia() {
+      if (!preview || !item) return;
+      const review = preview.direction_review;
+      el('previewPath').textContent = `候选结果：${preview.output_path}`;
+      const base = `${item.item_id}/${preview.run_id}/`;
+      const key = base + (review?.candidate_revision || 'original');
+      if (previewRun === key) {updateFinalPreview();return;}
+      const resumeFrame = previewRun?.startsWith(base) ? lowerFrame : 0;
+      resetPreviewMedia();
+      previewRun = key;
+      const query=previewQuery();
+      el('previewVideo').src=`/api/source-video?${query}`;
+      el('forwardVideo').src=`/api/preview-video?${query}&source=${review?'forward':'final'}`;
+      if(review) el('reverseVideo').src=`/api/preview-video?${query}&source=reverse`;
+      el('forwardTitle').textContent=review?'正向传播':'已有分割结果';
+      el('reverseCanvas').hidden=!review;el('reverseUnavailable').hidden=!!review;
+      el('lowerPreview').hidden=false;el('previewMessage').textContent='左右同步播放、同步跳转；不影响上方标注帧。暂停时显示原始掩码叠加。';
+      el('previewTimeline').max=item.frame_count-1;el('previewFrame').max=item.frame_count-1;
+      seekLowerPreview(resumeFrame);
+      updateFinalPreview();
+    }
+    function renderDirectionReview(running, previousRun, previousStatus) {
+      const review = preview?.direction_review;
+      el('directionReview').hidden = !review;
+      if (!review) return;
+      const classSelect=el('repairClass'), oldClass=classSelect.value;
+      classSelect.replaceChildren(...(preview.objects || []).map(o=>{const option=document.createElement('option');option.value=o.id;option.textContent=o.name;return option;}));
+      if([...classSelect.options].some(o=>o.value===oldClass))classSelect.value=oldClass;
+      candidateUnavailable=running || preview.stale || !classSelect.options.length || review.status!=='finalized';
+      el('repairUndo').disabled=running || preview.stale || !review.can_undo_final_correction;
+      const correction=review.last_final_correction;
+      el('repairStatus').textContent=correction ? `上次合并结果修正：第 ${correction.start}–${correction.end} 帧，去除 ${correction.removed_pixels} 像素，填补 ${correction.filled_pixels} 像素。` : '尚未修正合并结果。';
+      const finalized = review.status === 'finalized';
+      const rule='整体 IoU <0.85 且差异像素 >16 为其他冲突。分量数不同且无 IoU 冲突时归入连通分量冲突；一侧1个、另一侧多个且全部次分量 <50 像素时默认选单分量侧，可手动更改。不同类别建议方向相反则待选择。';
+      const filterDescription='自动过滤：先删除面积 <20 像素的分量（包括主分量），以及到主分量最近像素距离数值 > 自身面积数值的次分量；再按面积保留左器械1、右器械2、遮挡物2、object 2、region 1。传播后自动计算冲突。';
+      el('conflictSummary').textContent = `发现 ${review.conflict_frame_count} 个分歧帧，组成 ${review.intervals.length} 个片段；待选择 ${review.unresolved} 个。${finalized ? '已有合并结果。' : '请选择片段后生成合并结果。'} ${filterDescription} ${rule}`;
+      const selected = el('conflictInterval').value;
+      const categoryIntervals=review.intervals.filter(i=>el('conflictFilter').value==='C' ? (i.category ? i.category==='components' : i.structural_c) : i.category==='other');
+      const visibleIntervals=categoryIntervals.filter(i=>!el('unselectedConflictsOnly').checked || !review.choices[String(i.id)]);
+      el('conflictFilterStatus').textContent=visibleIntervals.length ? `当前显示 ${visibleIntervals.length} / ${categoryIntervals.length} 个片段。` : el('unselectedConflictsOnly').checked ? '当前类别没有未选择的片段。可切换类别或取消勾选查看已选片段。' : '当前类别没有冲突片段。';
+      el('conflictInterval').disabled = !visibleIntervals.length;
+      el('conflictInterval').replaceChildren(...visibleIntervals.map(i => {
+        const o = document.createElement('option'); o.value = String(i.id);
+        o.textContent = `${i.start}–${i.end} 帧${i.structural_c?' · [分量数不同]':''} · ${i.classes.join(', ')} · 最低 IoU ${i.worst_iou} · ${review.choices[String(i.id)] === 'forward' ? '已选正向' : review.choices[String(i.id)] === 'reverse' ? '已选反向' : '待选择'}`;
+        const details = formatComponentCounts(review.count_frame_details?.[String(i.start)]);
+        if (details) o.textContent += ` · 首帧：${details}`;
+        if (i.auto_direction && review.choices[String(i.id)] === i.auto_direction) o.textContent += ' · 符合自动候选规则（可改选）';
+        return o;
+      }));
+      if (visibleIntervals.some(i => String(i.id) === selected)) el('conflictInterval').value = selected;
+      for (const id of ['reanalyzeDirections','chooseForward','chooseReverse','chooseAllForward','chooseAllReverse','finalizeDirections']) el(id).disabled = running || preview.stale;
+      for (const id of ['chooseForward','chooseReverse','jumpConflict']) el(id).disabled = running || preview.stale || !visibleIntervals.length;
+      el('finalizeDirections').disabled ||= review.unresolved > 0;
+      updateComponentCounts();
+    }
+    async function refreshPropagation() {
+      if (!app || !item) return;
+      const workspaceId = app.workspace_id, itemId = item.item_id, epoch = workspaceEpoch;
+      try {
+        const data = await api(`/api/propagation?id=${encodeURIComponent(itemId)}&workspace_id=${encodeURIComponent(workspaceId)}`);
+        if (epoch !== workspaceEpoch || itemId !== item?.item_id) return;
+        const job = data.job;
+        const previousRun = preview?.run_id, previousStatus = preview?.direction_review?.status;
+        preview = data.preview;
+        if(preview)preview.supports_batch_fill_holes=data.supports_batch_fill_holes===true;
+        if(multiSavePending && multiSavePending.item===itemId && multiSavePending.run===preview?.run_id && job?.kind==='correction' && job.item_id===itemId && job.run_id===preview.run_id){
+          if(job.state==='complete'){multiDrafts.clear();multiSavePending=null;componentDraft=null;componentActive=false;el('componentStatus').textContent='全部草稿已保存，可撤销整批修改。';}
+          else if(job.state==='failed'){multiSavePending=null;el('componentStatus').textContent='批量保存失败，草稿仍保留，可重试。';}
+        }
+        renderManualMarks();
+        const perVideoJobs=Object.prototype.hasOwnProperty.call(data,'propagation_job');
+        const running = job?.state === 'running' && (job.item_id === itemId || !perVideoJobs);
+        const propagationJob=data.propagation_job || (job && (!job.kind || job.kind==='propagation') ? job : null);
+        const propagationRunning=propagationJob?.state==='running';
+        el('propagate').disabled = running || propagationRunning;
+        el('propagationLog').textContent = job?.log_tail || '';
+        if (running) el('propagationState').textContent = job.kind === 'reanalysis' ? '正在生成过滤版本并重算冲突，原始文件保留…' : job.kind === 'scan' ? '正在扫描合并结果的可疑帧…' : job.kind === 'correction' ? '正在保存合并结果修正并渲染视频…' : job.kind === 'finalize' ? '正在生成最终结果…' : job.item_id === itemId ? '双向传播中…' : '其他视频正在传播…';
+        else if (job?.state === 'failed' && job.item_id === itemId) el('propagationState').textContent = `传播失败：${job.error}`;
+        else if (preview) {
+          const timing = preview.timing_seconds?.total ? ` · 视频处理 ${Math.round(preview.timing_seconds.total)} 秒 · ${preview.video_processing_fps} FPS` : '';
+          el('propagationState').textContent = preview.stale ? '预览已过期：提示已修改，请重新传播' : `传播完成（${preview.settings?.model || 'Base+'}${timing}），可预览`;
+        }
+        else el('propagationState').textContent = '尚无传播结果';
+        if(perVideoJobs && propagationRunning && propagationJob.item_id!==itemId)el('propagationState').textContent += ` · ${propagationJob.item_id} 正在传播；本视频可选择、合并和编辑，但不能再启动传播。`;
+        renderDirectionReview(running, previousRun, previousStatus);
+        if (preview) {
+          updatePreviewMedia();
+        } else {
+          el('previewPath').textContent = '';
+          if (previewRun) resetPreviewMedia();
+        }
+        renderUnet(data);
+      } catch (error) {
+        if (epoch === workspaceEpoch && itemId === item?.item_id) el('propagationState').textContent = error.message;
+      }
+    }
+    function updateFrameInfo() {
+      const boxes = frameBoxes();
+      el('boxList').replaceChildren(...visibleLabels().filter(label => boxes[label.name]).map(label => {
+        const chip = document.createElement('span');
+        chip.className = 'chip' + (label.name === selectedLabel() ? ' active' : '');
+        chip.style.borderLeft = `4px solid ${label.color}`;
+        chip.textContent = `${label.name}: ${boxes[label.name].join(', ')}`;
+        return chip;
+      }));
+      const pointButtons = [];
+      for (const label of visibleLabels()) {
+        (framePoints()[label.name] || []).forEach((point, index) => {
+          const button = document.createElement('button');
+          button.style.borderLeft = `4px solid ${point.label === 1 ? '#36ce84' : '#ff656e'}`;
+          button.textContent = `${label.name} ${point.label === 1 ? '+' : '−'} (${point.x},${point.y}) ×`;
+          button.title = '删除这个点';
+          button.onclick = () => savePoint({action:'delete', point_index:index}, label.name);
+          pointButtons.push(button);
+        });
+      }
+      el('pointList').replaceChildren(...pointButtons);
+      const frames = [...new Set([...Object.keys(draft?.frames || {}), ...Object.keys(draft?.points || {})])].map(Number).sort((a,b) => a-b);
+      el('frameChips').replaceChildren(...frames.map(frame => {
+        const button = document.createElement('button');
+        button.textContent = `${frame}`;
+        if (frame === currentFrame) button.classList.add('primary');
+        button.onclick = () => setFrame(frame);
+        return button;
+      }));
+    }
+    function render() {
+      if (!image || !item || !draft) return;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(image, 0, 0);
+      for (const label of visibleLabels()) {
+        const box = frameBoxes()[label.name];
+        if (box) {
+          ctx.strokeStyle = label.color; ctx.lineWidth = label.name === selectedLabel() ? 3 : 2;
+          ctx.strokeRect(box[0] + 0.5, box[1] + 0.5, box[2] - box[0], box[3] - box[1]);
+          ctx.font = 'bold 17px sans-serif';
+          const w = ctx.measureText(label.name).width + 10;
+          const y = Math.max(0, box[1] - 22);
+          ctx.fillStyle = label.color; ctx.fillRect(box[0], y, w, 22);
+          ctx.fillStyle = '#10161d'; ctx.fillText(label.name, box[0] + 5, y + 17);
+        }
+        for (const point of framePoints()[label.name] || []) {
+          ctx.beginPath(); ctx.arc(point.x, point.y, 10, 0, Math.PI * 2);
+          ctx.fillStyle = label.color; ctx.fill();
+          ctx.beginPath(); ctx.arc(point.x, point.y, 6, 0, Math.PI * 2);
+          ctx.fillStyle = point.label === 1 ? '#23d375' : '#ff485d'; ctx.fill();
+          ctx.strokeStyle = '#10161d'; ctx.lineWidth = 1.5; ctx.stroke();
+          ctx.strokeStyle = '#10161d'; ctx.lineWidth = 2;
+          ctx.beginPath(); ctx.moveTo(point.x - 3, point.y); ctx.lineTo(point.x + 3, point.y);
+          if (point.label === 1) { ctx.moveTo(point.x, point.y - 3); ctx.lineTo(point.x, point.y + 3); }
+          ctx.stroke();
+        }
+      }
+      if (dragMode === 'box' && dragStart && dragEnd) {
+        ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2; ctx.setLineDash([8, 5]);
+        ctx.strokeRect(dragStart.x, dragStart.y, dragEnd.x - dragStart.x, dragEnd.y - dragStart.y);
+        ctx.setLineDash([]);
+      }
+      updateFrameInfo();
+    }
+    function pointerPosition(event) {
+      const rect = canvas.getBoundingClientRect();
+      const x = Math.round((event.clientX - rect.left) * canvas.width / rect.width);
+      const y = Math.round((event.clientY - rect.top) * canvas.height / rect.height);
+      return {x: Math.min(canvas.width, Math.max(0, x)), y: Math.min(canvas.height, Math.max(0, y))};
+    }
+    async function saveBox(box) {
+      if (!item || !selectedLabel() || busy) return;
+      busy = true;
+      const label = selectedLabel(), frame = currentFrame, itemId = item.item_id, workspaceId = app.workspace_id;
+      try {
+        const result = await api('/api/box', {item_id:itemId, frame,
+          label, box, revision:draft.revision, workspace_id:workspaceId});
+        draft = result.draft; refreshItemProgress(); render(); status(box ? `已保存 ${label} 框：${box.join(', ')}` : `已删除 ${label} 的框`);
+      } catch (error) { status(error.message, true); }
+      finally { busy = false; }
+    }
+    async function savePoint(operation, labelName = selectedLabel()) {
+      if (!item || !labelName || busy) return;
+      busy = true;
+      const frame = currentFrame, itemId = item.item_id, workspaceId = app.workspace_id;
+      try {
+        const result = await api('/api/point', {item_id:itemId, frame, label:labelName,
+          revision:draft.revision, workspace_id:workspaceId, ...operation});
+        draft = result.draft; refreshItemProgress(); render();
+        status(operation.action === 'delete' ? `已删除 ${labelName} 的点` :
+          `已保存 ${labelName} ${operation.point_label === 1 ? '内部正点' : '排除负点'} (${operation.x},${operation.y})`);
+      } catch (error) { status(error.message, true); }
+      finally { busy = false; }
+    }
+    canvas.addEventListener('pointerdown', event => {
+      if (!image || busy || !selectedLabel()) return;
+      canvas.setPointerCapture(event.pointerId);
+      dragMode = selectedMode();
+      dragClient = {x:event.clientX, y:event.clientY};
+      dragStart = pointerPosition(event); dragEnd = dragStart; render();
+    });
+    canvas.addEventListener('pointermove', event => {
+      if (!dragStart || dragMode !== 'box') return;
+      dragEnd = pointerPosition(event); render();
+    });
+    canvas.addEventListener('pointerup', event => {
+      if (!dragStart) return;
+      const end = pointerPosition(event);
+      const mode = dragMode;
+      const movement = Math.hypot(event.clientX - dragClient.x, event.clientY - dragClient.y);
+      const box = [Math.min(dragStart.x,end.x), Math.min(dragStart.y,end.y),
+        Math.max(dragStart.x,end.x), Math.max(dragStart.y,end.y)];
+      dragStart = dragEnd = dragClient = dragMode = null; render();
+      if (mode !== 'box') {
+        if (movement > 10) return status('点模式请单击目标位置');
+        const x = Math.min(canvas.width - 1, end.x), y = Math.min(canvas.height - 1, end.y);
+        return savePoint({action:'add', x, y, point_label:mode === 'positive' ? 1 : 0});
+      }
+      if (box[2] - box[0] < 2 || box[3] - box[1] < 2) return status('框太小；请拖拽画出目标');
+      saveBox(box);
+    });
+    canvas.addEventListener('pointercancel', () => { dragStart = dragEnd = dragClient = dragMode = null; render(); });
+    el('view').onchange = () => {
+      if (busy) { if (item) el('view').value = item.view; return status('正在保存，请稍后切换视角'); }
+      fillLabels(); fillItems();
+    };
+    el('item').onchange = () => loadItem(el('item').value);
+    el('label').onchange = updateLabelHint;
+    el('showAll').onchange = () => { render(); loadMaskFrame(); };
+    el('previewMode').onchange = () => {
+      el('opacityControls').style.display = el('previewMode').value === 'overlay' ? '' : 'none';
+      drawLowerPreview();
+    };
+    el('previewPlay').onclick = async () => {
+      const raw=el('previewVideo');if(!preview || lowerSeeking) return;
+      if(!raw.paused) { await seekLowerPreview(Math.floor(raw.currentTime*item.fps+.001));return; }
+      if(raw.ended || lowerFrame>=item.frame_count-1) await seekLowerPreview(0);
+      lowerMasks={};lowerEpoch++;
+      try {await Promise.all(activePreviewVideos().map(v=>v.play()));el('previewPlay').textContent='同步暂停';}
+      catch(e){for(const v of activePreviewVideos())v.pause();el('previewMessage').textContent=`播放失败：${e.message}`;}
+    };
+    el('previewVideo').onended=()=>{if(item && preview)seekLowerPreview(item.frame_count-1);};
+    for(const v of previewVideos) v.onerror=()=>{if(previewRun)el('previewMessage').textContent='视频读取失败，请刷新页面';};
+    el('previewGo').onclick=()=>seekLowerPreview(el('previewFrame').value);
+    el('previewFrame').onkeydown=e=>{if(e.key==='Enter')seekLowerPreview(el('previewFrame').value);};
+    el('previewPrev').onclick=()=>seekLowerPreview(lowerFrame-1);
+    el('previewNext').onclick=()=>seekLowerPreview(lowerFrame+1);
+    el('previewTimeline').onchange=()=>seekLowerPreview(el('previewTimeline').value);
+    el('previewSpeed').onchange=()=>{for(const v of previewVideos)v.playbackRate=Number(el('previewSpeed').value);};
+    const jumpConflict = () => {
+      const interval = preview?.direction_review?.intervals.find(i => String(i.id) === el('conflictInterval').value);
+      if (interval) { seekLowerPreview(interval.start);el('lowerPreview').scrollIntoView({behavior:'smooth',block:'center'}); }
+    };
+    el('conflictInterval').onchange = jumpConflict;
+    el('conflictFilter').onchange=()=>refreshPropagation();
+    el('unselectedConflictsOnly').onchange=()=>refreshPropagation();
+    el('jumpConflict').onclick = jumpConflict;
+    async function chooseDirection(direction, all = false) {
+      if(multiDrafts.size || multiSavePending)return status('请先保存或清空多帧草稿，再更改传播方向。',true);
+      if (!preview || !item) return;
+      if(preview.direction_review?.final_edit && !confirm('重新选择方向会回到合并步骤；当前单帧修正版本将保留在历史中，但不会自动带入重新合并的结果。继续？'))return;
+      try {
+        await api('/api/review-choice', {workspace_id:app.workspace_id, item_id:item.item_id,
+          run_id:preview.run_id, review_revision:preview.direction_review.revision, direction, interval_id:all ? 'all' : el('conflictInterval').value});
+        await refreshPropagation(); updatePreviewMedia();
+      } catch (error) { status(error.message, true); }
+    }
+    el('chooseForward').onclick = () => chooseDirection('forward');
+    el('chooseReverse').onclick = () => chooseDirection('reverse');
+    el('chooseAllForward').onclick = () => chooseDirection('forward', true);
+    el('chooseAllReverse').onclick = () => chooseDirection('reverse', true);
+    el('reanalyzeDirections').onclick=async()=>{
+      try{await api('/api/review-reanalyze',{workspace_id:app.workspace_id,item_id:item.item_id,run_id:preview.run_id,review_revision:preview.direction_review.revision});await refreshPropagation();}
+      catch(error){status(error.message,true);}
+    };
+    el('finalizeDirections').onclick = async () => {
+      if(multiDrafts.size || multiSavePending)return status('请先保存或清空多帧草稿，再重新合并。',true);
+      if(preview?.direction_review?.final_edit && !confirm('重新合并将使用正反向候选，不包含后续单帧修改；当前修正版本会保留在历史中。继续？'))return;
+      try {
+        await api('/api/review-finalize', {workspace_id:app.workspace_id, item_id:item.item_id, run_id:preview.run_id, review_revision:preview.direction_review.revision});
+        await refreshPropagation();
+      } catch (error) { status(error.message, true); }
+    };
+    el('maskOpacity').oninput = () => { el('maskOpacityValue').textContent = `${Math.round(Number(el('maskOpacity').value) * 100)}%`;drawLowerPreview(); };
+    async function undoSavedCorrection() {
+      if(!preview?.direction_review || !item)return;
+      if(multiDrafts.size || multiSavePending)return status('请先保存或清空全部草稿，再撤销已保存版本。',true);
+      try {
+        const payload={workspace_id:app.workspace_id,item_id:item.item_id,run_id:preview.run_id,review_revision:preview.direction_review.revision};
+        el('repairApply').disabled=true;el('repairUndo').disabled=true;
+        await api('/api/undo-correction',payload);
+        await refreshPropagation();
+      } catch(error){status(error.message,true);await refreshPropagation();}
+    }
+    el('repairApply').onclick=()=>previewComponents([...componentDraft.operations,{kind:'morphology',remove_area:Number(el('repairRemove').value),fill_area:Number(el('repairFill').value),keep_largest:el('repairKeep').checked}]);
+    el('repairUndo').onclick=undoSavedCorrection;
+    let componentDraft=null, componentBusy=false, componentStroke=null, componentActive=false, candidateUnavailable=true;
+    let multiDrafts=new Map(), multiSavePending=null;
+    const draftKey=p=>`${p.start}/${p.class_id}`;
+    function draftScopeMatches(p){return p.workspace_id===app?.workspace_id && p.item_id===item?.item_id && p.run_id===preview?.run_id && p.review_revision===preview?.direction_review?.revision;}
+    function renderMultiDrafts(){
+      const select=el('multiDraftList'),selected=select.value;
+      select.replaceChildren(...[...multiDrafts].map(([key,d])=>new Option(`第 ${d.payload.start} 帧 · ${d.className} · ${d.operations.length} 步`,key)));
+      if(multiDrafts.has(selected))select.value=selected;
+      const stale=[...multiDrafts.values()].some(d=>!draftScopeMatches(d.payload));
+      el('multiDraftStatus').textContent=multiSavePending?'正在统一保存，成功后清空草稿；失败保留草稿。':`未保存：${new Set([...multiDrafts.values()].map(d=>d.payload.start)).size} 帧、${multiDrafts.size} 个帧/类别草稿。${stale?'结果版本已变化，不能直接保存旧草稿。':'切换帧或类别自动保留；刷新页面会丢失草稿。'}`;
+      for(const id of ['multiDraftGo','multiDraftDiscard'])el(id).disabled=componentBusy || !!multiSavePending || !multiDrafts.size;
+      el('componentSave').disabled=componentBusy || !!multiSavePending || !multiDrafts.size || stale || candidateUnavailable;
+      el('componentDiscardCurrent').disabled=componentBusy || !!multiSavePending || !componentDraft || !multiDrafts.has(draftKey(componentDraft.payload));
+    }
+    window.addEventListener('beforeunload',event=>{if(multiDrafts.size || multiSavePending){event.preventDefault();event.returnValue='';}});
+    function componentCanvas(){return el('finalEditCanvas');}
+    const componentColors=['#ffce54','#58ddff','#ff7aa8','#8bea74','#ba99ff'];
+    function componentControls() {
+      const difference=el('resultPreviewSource').value==='difference';
+      el('differencePanel').hidden=!difference;el('finalModeControls').hidden=difference;
+      el('componentEditor').hidden=difference && preview?.direction_review?.status==='finalized';
+      const d=componentDraft, stale=d && (d.payload.workspace_id!==app?.workspace_id || d.payload.item_id!==item?.item_id || d.payload.run_id!==preview?.run_id || d.payload.review_revision!==preview?.direction_review?.revision);
+      if(stale && componentActive){componentActive=false;drawLowerPreview();}
+      for(const id of ['repairApply','componentFillAll','componentLargest','componentUndo','componentSave','componentDelete'])el(id).disabled=componentBusy || !componentActive || !d?.data || stale || candidateUnavailable;
+      el('componentLoad').disabled=componentBusy || !!multiSavePending || !preview?.direction_review || candidateUnavailable;
+      for(const id of ['editPrevFrame','editNextFrame','editGoFrame','editFrameNumber'])el(id).disabled=el('componentLoad').disabled;
+      el('editFrameNumber').max=item?item.frame_count-1:0;
+      el('batchLargest').disabled=componentBusy || !!multiSavePending || multiDrafts.size>0 || !preview?.direction_review || candidateUnavailable;
+      el('batchFillHoles').disabled=el('batchLargest').disabled || !preview?.supports_batch_fill_holes;
+      el('batchFillHoles').title=preview?.supports_batch_fill_holes?'':'后端更新待启用：请在运行任务结束后重启服务';
+      for(const id of ['batchStart','batchEnd'])el(id).max=item?item.frame_count-1:0;
+      el('repairClass').disabled=componentBusy;
+      el('componentExit').disabled=componentBusy || !componentActive;
+      el('finalEditCanvas').hidden=!componentActive || difference;
+      el('finalPreviewVideo').hidden=true;
+      el('finalDisplayCanvas').hidden=difference || componentActive || preview?.direction_review?.status!=='finalized';
+      el('finalPlaybackControls').hidden=difference || preview?.direction_review?.status!=='finalized';
+      el('finalPlay').disabled=componentActive;el('finalTimeline').disabled=componentActive;
+      el('finalEditCanvas').style.outline=componentActive?'3px solid #ffce54':'';
+      el('finalGo').disabled=componentBusy || preview?.direction_review?.status!=='finalized';
+      for(const id of ['finalPrev','finalNext','finalFrame'])el(id).disabled=el('finalGo').disabled;
+      el('finalFrame').max=item?item.frame_count-1:0;
+      el('componentDelete').disabled ||= !d?.selected;
+      for(const id of ['componentUndo','componentSave'])el(id).disabled ||= !d?.operations.length;
+      if(stale)el('componentStatus').textContent='合并结果版本或视频已变化，请重新载入编辑帧。';
+      renderMultiDrafts();
+      return !stale;
+    }
+    function drawComponents() {
+      const d=componentDraft;if(!componentActive || !d?.data)return;
+      const c=componentCanvas(), context=c.getContext('2d');
+      c.width=d.data.width;c.height=d.data.height;
+      context.fillStyle='#000';context.fillRect(0,0,c.width,c.height);
+      const overlay=el('finalDisplayMode').value==='overlay';
+      if(overlay && d.image?.complete && d.image.naturalWidth)context.drawImage(d.image,0,0,c.width,c.height);
+      const layerKey=`${d.selected}/${overlay}/${el('finalOpacity').value}`;
+      if(!d.layer || d.layerKey!==layerKey){
+      const layer=document.createElement('canvas');layer.width=c.width;layer.height=c.height;
+      const lc=layer.getContext('2d'), pixels=lc.createImageData(c.width,c.height);
+      const colors=d.data.components.map((o,i)=>[o.id,componentColors[i]]);
+      const palette=new Map(colors.map(([id,color])=>[id,[parseInt(color.slice(1,3),16),parseInt(color.slice(3,5),16),parseInt(color.slice(5,7),16)]]));
+      for(const [start,length,id] of d.data.runs){const rgb=id===d.selected?[255,255,255]:palette.get(id)||[140,165,190],alpha=overlay?Math.round(Number(el('finalOpacity').value)*255):255;for(let p=start;p<start+length;p++){const k=p*4;pixels.data[k]=rgb[0];pixels.data[k+1]=rgb[1];pixels.data[k+2]=rgb[2];pixels.data[k+3]=alpha;}}
+      lc.putImageData(pixels,0,0);d.layer=layer;d.layerKey=layerKey;
+      }
+      context.drawImage(d.layer,0,0);
+      context.lineWidth=2;context.font=`${Math.max(16,c.width/65)}px sans-serif`;
+      d.data.components.forEach((o,i)=>{const [x,y,w,h]=o.box;context.strokeStyle=componentColors[i];context.strokeRect(x,y,w,h);context.fillStyle='#000';context.fillRect(x,Math.max(0,y-23),190,23);context.fillStyle=componentColors[i];context.fillText(`#${i+1} · ${o.area} px`,x+2,Math.max(18,y-5));});
+      if(componentStroke){context.strokeStyle='#ff3333';context.lineWidth=Number(el('componentWidth').value)||3;context.lineCap='round';context.beginPath();componentStroke.forEach(([x,y],i)=>i?context.lineTo(x,y):context.moveTo(x,y));context.stroke();}
+    }
+    async function previewComponents(operations) {
+      const d=componentDraft;if(!d || componentBusy)return;
+      componentBusy=true;componentControls();
+      try {
+        const proposed=new Map(multiDrafts),key=draftKey(d.payload),previous=proposed.get(key);
+        if(!operations.length)proposed.delete(key);
+        else if(!previous || JSON.stringify(previous.operations)!==JSON.stringify(operations)){
+          proposed.delete(key);proposed.set(key,{payload:d.payload,operations:structuredClone(operations),className:d.className});
+        }
+        const frame_edits=[...proposed.values()].filter(entry=>entry.payload.start===d.payload.start).map(entry=>({...entry.payload,operations:entry.operations}));
+        const data=await api('/api/component-preview',{...d.payload,operations,frame_edits});
+        if(componentDraft!==d)return;
+        multiDrafts=proposed;
+        d.operations=operations;d.data=data;d.selected=0;d.point=null;d.layer=null;
+        el('componentList').replaceChildren(...data.components.map((o,i)=>{const b=document.createElement('button');b.textContent=`#${i+1}：${o.area} 像素`;b.style.color=componentColors[i];b.onclick=()=>{if(componentBusy)return;d.selected=o.id;d.point=o.point;drawComponents();componentControls();};return b;}));
+        el('componentStatus').textContent=`共 ${data.count} 个连通分量，列出面积前 ${Math.min(5,data.count)} 个；未保存操作 ${operations.length} 步。`;
+        drawComponents();
+      }catch(error){el('componentStatus').textContent=error.message;}
+      finally{componentBusy=false;componentControls();}
+    }
+    el('componentLoad').onclick=async(frameOverride)=>{
+      if(preview?.direction_review?.status!=='finalized' || componentBusy || multiSavePending)return;
+      if([...multiDrafts.values()].some(d=>!draftScopeMatches(d.payload))){status('请先处理旧版本草稿，不能与当前结果混合编辑。',true);return;}
+      const video=el('finalPreviewVideo');video.pause();
+      const frame=Number.isInteger(frameOverride)?frameOverride:Math.min(item.frame_count-1,Math.floor(video.currentTime*item.fps+.001));
+      el('finalFrame').value=frame;
+      const payload={workspace_id:app.workspace_id,item_id:item.item_id,run_id:preview.run_id,review_revision:preview.direction_review.revision,direction:'final',class_id:Number(el('repairClass').value),start:frame,end:frame,remove_area:0,fill_area:0,keep_largest:true};
+      componentActive=true;
+      const d=componentDraft={payload,operations:[],selected:0,image:new Image(),className:el('repairClass').selectedOptions[0].textContent};
+      el('componentEditor').open=true;
+      el('previewPlay').textContent='同步播放';
+      d.image.onload=()=>{if(componentDraft===d)drawComponents();};
+      d.image.src=`/api/frame?id=${encodeURIComponent(item.item_id)}&workspace_id=${encodeURIComponent(app.workspace_id)}&frame=${frame}`;
+      el('componentContext').textContent=`${item.item_id} · 合并结果 · ${el('repairClass').selectedOptions[0].textContent} · 第 ${frame} 帧`;
+      el('editFrameNumber').value=frame;
+      await previewComponents(multiDrafts.get(draftKey(payload))?.operations || []);
+      drawLowerPreview();
+    };
+    function componentPoint(event){const c=componentCanvas(),r=c.getBoundingClientRect();return [Math.max(0,Math.min(c.width-1,Math.floor((event.clientX-r.left)*c.width/r.width))),Math.max(0,Math.min(c.height-1,Math.floor((event.clientY-r.top)*c.height/r.height)))];}
+    for(const canvasId of ['finalEditCanvas']){
+    el(canvasId).onpointerdown=event=>{
+      if(!componentActive || event.currentTarget!==componentCanvas() || event.button!==0 || componentBusy || !componentDraft?.data || !componentControls())return;
+      const point=componentPoint(event),d=componentDraft;
+      if(['cut','paint','erase'].includes(el('componentMode').value)){componentStroke=[point];event.currentTarget.setPointerCapture(event.pointerId);}
+      else {const index=point[1]*d.data.width+point[0],run=d.data.runs.find(([start,length])=>index>=start && index<start+length);d.selected=run?.[2]||0;d.point=point;drawComponents();componentControls();}
+    };
+    el(canvasId).onpointermove=event=>{if(componentStroke){if(componentStroke.length<10000)componentStroke.push(componentPoint(event));drawComponents();}};
+    el(canvasId).onpointerup=async event=>{if(!componentStroke)return;const points=componentStroke;componentStroke=null;if(event.currentTarget.hasPointerCapture(event.pointerId))event.currentTarget.releasePointerCapture(event.pointerId);await previewComponents([...componentDraft.operations,{kind:el('componentMode').value,points,width:Number(el('componentWidth').value),overwrite:el('paintOverwrite').checked}]);};
+    el(canvasId).onpointercancel=()=>{componentStroke=null;drawComponents();};
+    }
+    el('componentExit').onclick=()=>{
+      if(componentBusy || multiSavePending)return;
+      componentActive=false;componentDraft=null;componentStroke=null;
+      el('componentList').replaceChildren();el('componentContext').textContent='';el('componentStatus').textContent='已退出编辑，多帧草稿保留；普通视频仍显示已保存版本。';
+      componentControls();drawLowerPreview();loadLowerExactMasks();loadFinalExact();drawFinalDisplay();
+    };
+    el('componentDelete').onclick=()=>{const d=componentDraft;if(d?.selected)previewComponents([...d.operations,{kind:'delete',x:d.point[0],y:d.point[1]}]);};
+    el('componentUndo').onclick=()=>previewComponents(componentDraft.operations.slice(0,-1));
+    el('componentDiscardCurrent').onclick=()=>{if(componentDraft && !componentBusy && !multiSavePending)previewComponents([]);};
+    el('multiDraftGo').onclick=()=>{
+      const d=multiDrafts.get(el('multiDraftList').value);if(!d || !draftScopeMatches(d.payload))return;
+      el('repairClass').value=d.payload.class_id;el('resultPreviewSource').value='merged';el('componentEditor').open=true;
+      seekFinalFrame(d.payload.start,true);
+    };
+    el('multiDraftDiscard').onclick=()=>{
+      if(componentBusy || multiSavePending || !confirm('丢弃所有未保存的多帧草稿？'))return;
+      multiDrafts.clear();componentActive=false;componentDraft=null;componentStroke=null;componentControls();loadFinalExact();drawFinalDisplay();
+    };
+    el('componentFillAll').onclick=()=>previewComponents([...componentDraft.operations,{kind:'fill_holes'}]);
+    el('componentLargest').onclick=()=>previewComponents([...componentDraft.operations,{kind:'keep_largest'}]);
+    el('componentSave').onclick=async()=>{
+      if(componentBusy || multiSavePending || !multiDrafts.size || candidateUnavailable || [...multiDrafts.values()].some(d=>!draftScopeMatches(d.payload)))return;
+      componentBusy=true;componentControls();
+      try {
+        const entries=[...multiDrafts.values()],base=entries[0].payload;
+        await api('/api/correct-candidate',{...base,edits:entries.map(d=>({...d.payload,operations:d.operations}))});
+        multiSavePending={run:base.run_id,item:base.item_id};
+        componentActive=false;componentDraft=null;drawLowerPreview();
+        el('componentStatus').textContent='已提交全部草稿，统一生成一次合并视频；成功后可撤销整批。';
+        await refreshPropagation();
+      }catch(error){el('componentStatus').textContent=error.message;}
+      finally{componentBusy=false;componentControls();}
+    };
+    async function applyBatchOperation(kind){
+      if(componentBusy || candidateUnavailable || !preview?.direction_review)return;
+      if(multiDrafts.size || multiSavePending){el('batchStatus').textContent='请先保存或清空全部多帧草稿，再进行区间处理。';return;}
+      const start=Number(el('batchStart').value),end=Number(el('batchEnd').value),classId=Number(el('repairClass').value);
+      if(!Number.isInteger(start)||!Number.isInteger(end)||start<0||end<start||end>=item.frame_count){el('batchStatus').textContent='请输入有效起止帧，起始帧不能大于结束帧。';return;}
+      const name=el('repairClass').selectedOptions[0].textContent;
+      const description=kind==='fill_holes'?'逐帧填充封闭背景孔洞（不覆盖其他类别）':'逐帧只保留最大连通分量';
+      if(!confirm(`将第 ${start}–${end} 帧（含首尾，共 ${end-start+1} 帧）的 ${name} ${description}，保存为新的合并版本。确定？`))return;
+      componentBusy=true;componentControls();
+      try{
+        await api('/api/correct-candidate',{workspace_id:app.workspace_id,item_id:item.item_id,run_id:preview.run_id,review_revision:preview.direction_review.revision,direction:'final',class_id:classId,start,end,remove_area:0,fill_area:0,keep_largest:true,batch_keep_largest:kind==='keep_largest',batch_fill_holes:kind==='fill_holes',operations:[{kind}]});
+        componentActive=false;componentDraft=null;componentStroke=null;
+        el('batchStatus').textContent='已提交区间处理；请等待合并结果新版本生成。可通过“撤销上次已保存修正”撤销整个区间操作。';
+        await refreshPropagation();
+      }catch(error){el('batchStatus').textContent=error.message;}
+      finally{componentBusy=false;componentControls();}
+    };
+    el('batchLargest').onclick=()=>applyBatchOperation('keep_largest');
+    el('batchFillHoles').onclick=()=>applyBatchOperation('fill_holes');
+    setInterval(componentControls,1000);
+    let differenceKey='', differenceBusy=false, differenceData=null;
+    function drawDifference(){
+      const d=differenceData;if(!d)return;
+      const canvas=el('differenceCanvas'),c=canvas.getContext('2d');canvas.width=d.mask.naturalWidth;canvas.height=d.mask.naturalHeight;
+      c.fillStyle='#000';c.fillRect(0,0,canvas.width,canvas.height);
+      if(el('differenceOverlay').checked)c.drawImage(d.raw,0,0);
+      c.drawImage(d.mask,0,0);
+    }
+    async function refreshDifference(){
+      if(differenceBusy || !preview?.direction_review || !item || el('resultPreviewSource').value!=='difference')return;
+      const frame=el('differenceFollow').checked?lowerFrame:Math.max(0,Math.min(item.frame_count-1,Math.round(Number(el('differenceFrame').value)||0)));
+      el('differenceFrame').value=frame;el('differenceFrame').max=item.frame_count-1;
+      const query=previewQuery(),key=`${query}/${frame}`;
+      if(key===differenceKey)return;
+      differenceBusy=true;el('differenceStatus').textContent=`正在读取第 ${frame} 帧差异…`;
+      try{
+        const data=await api(`/api/difference-frame?${query}&frame=${frame}`);
+        const load=src=>new Promise((resolve,reject)=>{const img=new Image();img.onload=()=>resolve(img);img.onerror=()=>reject(new Error('差异预览图像读取失败'));img.src=src;});
+        const [mask,raw]=await Promise.all([load(data.image),load(`/api/frame?${query}&frame=${frame}`)]);
+        if(!preview || !item || query!==previewQuery())return;
+        const current=el('differenceFollow').checked?lowerFrame:Number(el('differenceFrame').value);
+        if(current!==frame)return;
+        differenceKey=key;differenceData={mask,raw};drawDifference();
+        el('differenceStatus').textContent=`第 ${frame} 帧 · 不同像素 ${data.different_pixels} · 仅正向 ${data.forward_only} · 仅反向 ${data.reverse_only} · 类别不同 ${data.class_mismatch}`;
+      }catch(error){el('differenceStatus').textContent=error.message;}
+      finally{differenceBusy=false;}
+    }
+    el('resultPreviewSource').onchange=()=>{el('finalPreviewVideo').pause();componentControls();refreshDifference();};
+    el('differenceOverlay').onchange=drawDifference;
+    el('differenceFrame').oninput=()=>{el('differenceFollow').checked=false;};
+    el('differenceFollow').onchange=()=>refreshDifference();
+    el('differenceGo').onclick=()=>{el('differenceFollow').checked=false;el('differenceFrame').value=Math.max(0,Math.min(item.frame_count-1,Math.round(Number(el('differenceFrame').value)||0)));refreshDifference();};
+    for(const [id,step] of [['differencePrev',-1],['differenceNext',1]])el(id).onclick=()=>{el('differenceFrame').value=Number(el('differenceFrame').value)+step;el('differenceGo').onclick();};
+    setInterval(refreshDifference,500);
+    function renderManualMarks() {
+      const marks=preview?.direction_review?.manual_revision_frames || [];
+      for(const id of ['reviewMarkedFrames','finalMarkedFrames']){
+        const select=el(id),old=select.value;
+        select.replaceChildren(...marks.map(m=>new Option(`第 ${m.frame} 帧 · ${m.done?'已完成':'待修正'}`,m.frame)));
+        if(marks.some(m=>String(m.frame)===old))select.value=old;
+        select.disabled=!marks.length;
+      }
+      for(const id of ['jumpMarkedCandidate','removeMarkedFrame'])el(id).disabled=!marks.length;
+      el('editMarkedFrame').disabled=!marks.length || preview?.direction_review?.status!=='finalized';
+      el('markFrameStatus').textContent=`已标记 ${marks.length} 帧，待修正 ${marks.filter(m=>!m.done).length} 帧。标记保存在当前视频传播版本，合并后仍保留。`;
+    }
+    async function updateManualMark(frame,action='add') {
+      if(!preview || !item)return;
+      if(action==='done' && [...multiDrafts.values()].some(d=>d.payload.start===Number(frame))){status('请先保存该帧草稿，再标记完成。',true);return;}
+      const run=preview.run_id,id=item.item_id,workspace=app.workspace_id;
+      try{
+        const data=await api('/api/revision-frame',{workspace_id:workspace,item_id:id,run_id:run,frame:Number(frame),action});
+        if(preview?.run_id!==run || item?.item_id!==id || app.workspace_id!==workspace)return;
+        preview.direction_review.manual_revision_frames=data.frames;renderManualMarks();
+      }catch(error){status(error.message,true);}
+    }
+    el('markLowerFrame').onclick=()=>updateManualMark(lowerFrame);
+    el('markSpecifiedFrame').onclick=()=>updateManualMark(el('markFrameNumber').value);
+    el('removeMarkedFrame').onclick=()=>{if(el('reviewMarkedFrames').value!=='')updateManualMark(el('reviewMarkedFrames').value,'remove');};
+    el('jumpMarkedCandidate').onclick=()=>{if(el('reviewMarkedFrames').value!=='')seekLowerPreview(Number(el('reviewMarkedFrames').value));};
+    el('editMarkedFrame').onclick=()=>{if(el('finalMarkedFrames').value!==''){el('resultPreviewSource').value='merged';el('componentEditor').open=true;componentControls();seekFinalFrame(el('finalMarkedFrames').value,true);}};
+    el('markFinalFrame').onclick=()=>updateManualMark(componentActive?componentDraft.payload.start:finalFrameIndex());
+    el('markFrameDone').onclick=()=>updateManualMark(componentActive?componentDraft.payload.start:finalFrameIndex(),'done');
+    async function seekFinalFrame(frame,edit=false){
+      if(componentBusy || multiSavePending || preview?.direction_review?.status!=='finalized')return;
+      edit = edit || componentActive;
+      componentActive=false;componentDraft=null;componentStroke=null;componentControls();
+      frame=Math.max(0,Math.min(item.frame_count-1,Math.round(Number(frame)||0)));
+      const video=el('finalPreviewVideo');video.pause();
+      if(video.readyState<1)await new Promise(resolve=>video.addEventListener('loadedmetadata',resolve,{once:true}));
+      video.currentTime=(frame+.1)/item.fps;el('finalFrame').value=frame;
+      if(edit)await el('componentLoad').onclick(frame);
+    }
+    el('finalGo').onclick=()=>seekFinalFrame(el('finalFrame').value);
+    el('finalFrame').onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();seekFinalFrame(el('finalFrame').value);}};
+    el('finalPrev').onclick=()=>seekFinalFrame(finalFrameIndex()-1);
+    el('finalNext').onclick=()=>seekFinalFrame(finalFrameIndex()+1);
+    const currentEditFrame=()=>componentActive && componentDraft ? componentDraft.payload.start : finalFrameIndex();
+    const jumpEditingFrame=frame=>{
+      if(componentBusy || multiSavePending || candidateUnavailable)return;
+      el('resultPreviewSource').value='merged';el('componentEditor').open=true;
+      return seekFinalFrame(frame,true);
+    };
+    el('editPrevFrame').onclick=()=>jumpEditingFrame(currentEditFrame()-1);
+    el('editNextFrame').onclick=()=>jumpEditingFrame(currentEditFrame()+1);
+    el('editGoFrame').onclick=()=>jumpEditingFrame(el('editFrameNumber').value);
+    el('editFrameNumber').onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();jumpEditingFrame(el('editFrameNumber').value);}};
+    el('finalPreviewVideo').ontimeupdate=()=>{if(item){el('finalTimeline').value=finalFrameIndex();el('finalTime').textContent=`第 ${finalFrameIndex()} 帧 · ${(el('finalPreviewVideo').currentTime).toFixed(2)} s`;if(!componentActive && document.activeElement!==el('finalFrame'))el('finalFrame').value=finalFrameIndex();}};
+    el('finalPreviewVideo').addEventListener('seeked',()=>{const raw=el('finalSourceVideo');if(raw.readyState>=1)raw.currentTime=el('finalPreviewVideo').currentTime;loadFinalExact();drawFinalDisplay();});
+    el('finalPreviewVideo').addEventListener('loadeddata',()=>{loadFinalExact();drawFinalDisplay();});
+    el('finalPreviewVideo').addEventListener('pause',()=>{el('finalSourceVideo').pause();el('finalPlay').textContent='播放合并结果';loadFinalExact();drawFinalDisplay();});
+    el('finalPlay').onclick=async()=>{
+      const mask=el('finalPreviewVideo'),raw=el('finalSourceVideo');
+      if(!mask.paused){mask.pause();return;}
+      try{
+        if(raw.readyState<1)await new Promise(resolve=>raw.addEventListener('loadedmetadata',resolve,{once:true}));
+        raw.currentTime=mask.currentTime;
+        await Promise.all([raw.play(),mask.play()]);el('finalPlay').textContent='暂停合并结果';
+      }catch(error){mask.pause();raw.pause();el('componentStatus').textContent=error.message;}
+    };
+    el('finalTimeline').oninput=()=>seekFinalFrame(el('finalTimeline').value);
+    el('finalDisplayMode').onchange=()=>{el('finalOpacityControls').hidden=el('finalDisplayMode').value!=='overlay';drawComponents();drawFinalDisplay();};
+    el('finalOpacity').oninput=()=>{drawComponents();drawFinalDisplay();};
+    el('repairClass').onchange=()=>{
+      const edit=componentActive,frame=componentDraft?.payload.start ?? finalFrameIndex();
+      componentActive=false;componentDraft=null;componentControls();loadFinalExact();drawFinalDisplay();
+      if(edit)el('componentLoad').onclick(frame);
+    };
+    el('propagate').onclick = async () => {
+      if(multiDrafts.size || multiSavePending)return status('请先保存或清空多帧草稿，再重新传播。',true);
+      if (!item || busy) return;
+      try {
+        const result = await api('/api/propagate', {
+          item_id:item.item_id, workspace_id:app.workspace_id,
+          model:el('sam2Model').value, device:el('sam2Device').value,
+          compile_mode:el('compileMode').value,
+          offload_video_to_cpu:el('offloadVideo').checked,
+          offload_state_to_cpu:el('offloadState').checked,
+        });
+        el('propagationState').textContent = '传播中…';
+        el('propagate').disabled = true;
+        el('propagationLog').textContent = result.job?.log_tail || '';
+      } catch (error) { el('propagationState').textContent = error.message; }
+    };
+    setInterval(() => { if (item) refreshPropagation(); }, 2500);
+    el('prev1').onclick = () => setFrame(currentFrame - 1);
+    el('next1').onclick = () => setFrame(currentFrame + 1);
+    el('prev10').onclick = () => setFrame(currentFrame - 10);
+    el('next10').onclick = () => setFrame(currentFrame + 10);
+    el('goFrame').onclick = () => setFrame(el('frame').value);
+    el('frame').onkeydown = event => { if (event.key === 'Enter') setFrame(el('frame').value); };
+    let sliderTimer;
+    el('timeline').oninput = () => { clearTimeout(sliderTimer); sliderTimer = setTimeout(() => setFrame(el('timeline').value), 130); };
+    el('zoom').oninput = updateZoom;
+    el('deleteBox').onclick = () => saveBox(null);
+    el('saveLabels').onclick = async () => {
+      if (busy) return;
+      busy = true;
+      try {
+        const view = el('view').value;
+        const result = await api('/api/labels', {view, text:el('labelsText').value,
+          workspace_id:app.workspace_id});
+        app.labels[view] = {text:el('labelsText').value, path:result.path, parsed:result.labels};
+        fillLabels(); render(); status(`已保存 ${view} 类别：${result.path}`);
+      } catch (error) { status(error.message, true); }
+      finally { busy = false; }
+    };
+    el('syncLabels').onclick = async () => {
+      if (!app || busy) return;
+      const view = el('view').value;
+      if (el('labelsText').value !== app.labels[view]?.text &&
+          !confirm('当前文本框有未保存的修改。继续同步会重新载入已保存的标签，确定吗？')) return;
+      busy = true;
+      try {
+        const data = await api('/api/sync-labels', {workspace_id:app.workspace_id});
+        app = data;
+        fillLabels(); render();
+        const result = data.sync_result;
+        status([...result.events, ...result.warnings].join('\n') || '原始标签与工作标签已经一致');
+      } catch (error) { status(error.message, true); }
+      finally { busy = false; }
+    };
+    el('saveNote').onclick = async () => {
+      if (!item || busy) return;
+      busy = true;
+      try {
+        const result = await api('/api/note', {item_id:item.item_id, frame:currentFrame,
+          note:el('note').value, revision:draft.revision, workspace_id:app.workspace_id});
+        draft = result.draft; status(`第 ${currentFrame} 帧备注已保存`);
+      } catch (error) { status(error.message, true); }
+      finally { busy = false; }
+    };
+    window.addEventListener('keydown', event => {
+      if (['INPUT','TEXTAREA','SELECT'].includes(document.activeElement?.tagName)) return;
+      if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+        event.preventDefault();
+        setFrame(currentFrame + (event.key === 'ArrowLeft' ? -1 : 1) * (event.shiftKey ? 10 : 1));
+      }
+    });
+    new ResizeObserver(updateZoom).observe(el('frameWrap'));
+    (async () => {
+      try {
+        loadWorkspace(await api('/api/bootstrap'));
+      } catch (error) { status(error.message, true); }
+    })();
+  </script>
+</body>
+</html>
