@@ -228,8 +228,8 @@ The final dataset adds `front_occluder`, `front_object`, `front_region`,
 
 GitHub 保存源码、配置和文档；数据与运行结果保留在本地。将原始数据放在
 `segdata/origin/`，标注、预览、训练缓存及模型放在 `segdata/temp/`，导出数据放在
-`segdata/final/`。这些目录仅跟踪 `.gitkeep`，目录内的标签、提示、图像、视频、
-评分和权重均不参与普通 Git 同步。
+`segdata/final/`。`segdata/origin/` 整目录忽略，`temp/` 和 `final/` 仅跟踪
+`.gitkeep`；这些目录内的标签、提示、图像、视频、评分和权重均不参与普通 Git 同步。
 
 根目录的数据、输出、结果和缓存目录，模型权重文件，以及 `demo/data/`、
 `notebooks/images/`、`notebooks/videos/`、`sav_dataset/example/` 中的示例数据
