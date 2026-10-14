@@ -6,14 +6,29 @@ __pycache__/
 *.egg*
 build/*
 _C.*
-outputs/*
-checkpoints/*.pt
-demo/backend/checkpoints/*.pt
+
+# Local datasets and generated artifacts. These directories keep their local
+# contents, but ordinary git add / GitHub synchronization must not upload them.
+# Keep data paths explicit: demo/backend/server/data and training/dataset are code.
+/data/
+/dataset/
 datasets/
+/output/
+outputs/
+/result/
+results/
 runs/
-yolo*.pt
+/cache/
+/.cache/
+/tmp/
+/temp/
+/models/
+weights/
 generated_sam2_prompts/
 newdatat/
+
+# Raw datasets, intermediate labeling/training work, and exported datasets.
+# Only the three empty-directory placeholders belong in the repository.
 segdata/*
 !segdata/origin/
 !segdata/temp/
@@ -24,3 +39,44 @@ segdata/final/*
 !segdata/origin/.gitkeep
 !segdata/temp/.gitkeep
 !segdata/final/.gitkeep
+
+# Example media and example annotations are data, too.
+/demo/data/
+/notebooks/images/
+/notebooks/videos/
+/sav_dataset/example/
+
+# Model files are local; keep the source-controlled checkpoint download script.
+/checkpoints/*
+!/checkpoints/download_ckpts.sh
+/demo/backend/checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.engine
+*.tflite
+
+# Dataset tables, tensor caches, and generated work directories, wherever saved.
+*.parquet
+*.arrow
+*.npy
+*.npz
+*.h5
+*.hdf5
+manual_seed/
+sam2_preview/
+sam2_preview_integrated/
+unet_preview/
+raw_mask_frames/
+mask_frames/
+overlay_frames/
+predictions/
+training_cache/
+semantic_seg_light_cache/
+video_quality_v2/
+quality_scan/
+wandb/
+lightning_logs/
+*.log
