@@ -28,15 +28,13 @@ generated_sam2_prompts/
 newdatat/
 
 # Raw datasets, intermediate labeling/training work, and exported datasets.
-# Only the three empty-directory placeholders belong in the repository.
+# Ignore origin as a whole; retain empty-directory placeholders only for temp/final.
 segdata/*
-!segdata/origin/
+/segdata/origin/
 !segdata/temp/
 !segdata/final/
-segdata/origin/*
 segdata/temp/*
 segdata/final/*
-!segdata/origin/.gitkeep
 !segdata/temp/.gitkeep
 !segdata/final/.gitkeep
 
